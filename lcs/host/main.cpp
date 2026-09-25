@@ -8,6 +8,10 @@
 #include "ge_renderer.hpp"
 #include "lcs_render_config.hpp"
 
+#if defined(__ANDROID__)
+#include "android_debug.hpp"
+#endif
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -22,6 +26,9 @@ void register_generated_functions(Runtime &runtime);
 #endif
 
 int main(int argc, char **argv) {
+#if defined(__ANDROID__)
+    lcs::android_debug::set_stage(lcs::android_debug::Stage::MainStarted);
+#endif
     std::filesystem::path elf_path = "game/EBOOT.ELF";
     std::filesystem::path game_root = "game";
     std::uint64_t max_dispatches = std::numeric_limits<std::uint64_t>::max();
@@ -50,9 +57,15 @@ int main(int argc, char **argv) {
         lcs::initialize_lcs_render_configuration(executable_directory);
 
         auto elf = psprecomp::Elf32Image::from_file(elf_path);
+#if defined(__ANDROID__)
+        lcs::android_debug::set_stage(lcs::android_debug::Stage::ElfLoaded);
+#endif
 
         psprecomp::Runtime runtime;
         runtime.set_game_root(game_root);
+#if defined(__ANDROID__)
+        lcs::android_debug::set_stage(lcs::android_debug::Stage::RuntimeReady);
+#endif
 
         const auto stats = elf.load_and_relocate(runtime.memory(), psprecomp::kDefaultPspUserLoadBase);
         std::cout << "Loaded " << elf_path.string() << " (" << stats.total << " relocations applied)\n" << std::flush;
@@ -75,6 +88,9 @@ int main(int argc, char **argv) {
             static_cast<std::uint32_t>((image_end + 0xFFu) & ~0xFFull);
         lcs::display_window_init();
         lcs::install_profile(runtime, user_arena_start);
+#if defined(__ANDROID__)
+        lcs::android_debug::set_stage(lcs::android_debug::Stage::ProfileInstalled);
+#endif
 
         std::string gpu_backend_error;
         if (!lcs::initialize_ge_gpu_backend(gpu_backend_error))
@@ -97,6 +113,9 @@ int main(int argc, char **argv) {
 
         const std::uint32_t entry = elf.runtime_entry(psprecomp::kDefaultPspUserLoadBase);
         std::cout << "Running from entry " << psprecomp::hex32(entry) << "\n" << std::flush;
+#if defined(__ANDROID__)
+        lcs::android_debug::set_stage(lcs::android_debug::Stage::Running);
+#endif
         runtime.run(entry, max_dispatches);
         lcs::ge_worker_shutdown();
 
