@@ -617,7 +617,11 @@ public final class MainActivity extends Activity {
                 + "InvertCameraY=false\n"
                 + "ModernControlScheme=false\n\n"
                 + "[Widescreen]\n"
-                + "Enabled=true\n";
+                + "Enabled=true\n\n"
+                + "[Diagnostics]\n"
+                + "LogToFile=true\n"
+                + "LogFile=android_runtime.log\n"
+                + "FlushEveryLine=true\n";
 
         try (FileOutputStream out = new FileOutputStream(config)) {
             out.write(text.getBytes(StandardCharsets.UTF_8));
