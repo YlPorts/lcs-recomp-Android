@@ -1,6 +1,7 @@
 #include "display_window.hpp"
 
 #include "android_host.hpp"
+#include "android_debug.hpp"
 #include "ge_gpu_backend.hpp"
 #include "lcs_controls.hpp"
 #include "lcs_render_config.hpp"
@@ -188,6 +189,7 @@ bool ensure_egl_locked() {
 
     g_egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (g_egl_display == EGL_NO_DISPLAY || !eglInitialize(g_egl_display, nullptr, nullptr)) {
+        android_debug::note_egl_ready(false);
         log_error("eglInitialize failed");
         destroy_egl_locked();
         return false;
@@ -206,6 +208,7 @@ bool ensure_egl_locked() {
     EGLint config_count = 0;
     if (!eglChooseConfig(g_egl_display, kConfigAttributes, &config, 1, &config_count) ||
         config_count == 0) {
+        android_debug::note_egl_ready(false);
         log_error("eglChooseConfig failed");
         destroy_egl_locked();
         return false;
@@ -222,6 +225,7 @@ bool ensure_egl_locked() {
     g_egl_context = eglCreateContext(
         g_egl_display, config, EGL_NO_CONTEXT, kContextAttributes);
     if (g_egl_context == EGL_NO_CONTEXT) {
+        android_debug::note_egl_ready(false);
         log_error("eglCreateContext ES3 failed");
         destroy_egl_locked();
         return false;
@@ -230,6 +234,7 @@ bool ensure_egl_locked() {
     g_egl_surface = eglCreateWindowSurface(g_egl_display, config, g_window, nullptr);
     if (g_egl_surface == EGL_NO_SURFACE ||
         !eglMakeCurrent(g_egl_display, g_egl_surface, g_egl_surface, g_egl_context)) {
+        android_debug::note_egl_ready(false);
         log_error("eglCreateWindowSurface/eglMakeCurrent failed");
         destroy_egl_locked();
         return false;
@@ -237,9 +242,11 @@ bool ensure_egl_locked() {
 
     (void)eglSwapInterval(g_egl_display, 1);
     if (!create_program_locked()) {
+        android_debug::note_egl_ready(false);
         destroy_egl_locked();
         return false;
     }
+    android_debug::note_egl_ready(true);
     return true;
 }
 
@@ -346,7 +353,8 @@ void present_rgba_locked(std::span<const std::byte> rgba,
 
     if (g_sampler_location >= 0) glUniform1i(g_sampler_location, 0);
     glDrawArrays(GL_TRIANGLES, 0, 3);
-    (void)eglSwapBuffers(g_egl_display, g_egl_surface);
+    const bool swapped = eglSwapBuffers(g_egl_display, g_egl_surface) == EGL_TRUE;
+    android_debug::note_swap(swapped);
 }
 
 }  // namespace
@@ -403,21 +411,34 @@ void display_window_present(psprecomp::Runtime &runtime, std::uint32_t frame_buf
     if (now - last_present < std::chrono::milliseconds(33)) return;
     last_present = now;
 
-    if (frame_buffer == 0u || width == 0u || height == 0u || buffer_width == 0u) return;
+    android_debug::note_present_attempt(frame_buffer, buffer_width, pixel_format, width, height);
+    if (frame_buffer == 0u || width == 0u || height == 0u || buffer_width == 0u) {
+        android_debug::note_present_pixels(0u, 0u);
+        return;
+    }
     const std::uint32_t bpp = bytes_per_pixel(pixel_format);
     const std::uint32_t stride = buffer_width * bpp;
     const std::size_t total = static_cast<std::size_t>(stride) * height;
     const std::uint8_t *source = runtime.memory().raw_pointer(frame_buffer, total);
-    if (source == nullptr) return;
+    if (source == nullptr) {
+        android_debug::note_present_pixels(0u, 0u);
+        return;
+    }
 
     g_rgba.resize(static_cast<std::size_t>(width) * height * 4u);
+    std::uint64_t non_black = 0u;
     for (std::uint32_t y = 0u; y < height; ++y) {
         const std::uint8_t *row = source + static_cast<std::size_t>(y) * stride;
         for (std::uint32_t x = 0u; x < width; ++x) {
-            unpack_rgba(row + static_cast<std::size_t>(x) * bpp, pixel_format,
-                        g_rgba.data() + (static_cast<std::size_t>(y) * width + x) * 4u);
+            std::uint8_t *destination =
+                g_rgba.data() + (static_cast<std::size_t>(y) * width + x) * 4u;
+            unpack_rgba(row + static_cast<std::size_t>(x) * bpp, pixel_format, destination);
+            if (destination[0] != 0u || destination[1] != 0u || destination[2] != 0u)
+                ++non_black;
         }
     }
+    android_debug::note_present_pixels(non_black,
+        static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height));
 
     const auto bytes = std::as_bytes(std::span<const std::uint8_t>(g_rgba));
     std::lock_guard<std::mutex> guard(g_surface_mutex);
