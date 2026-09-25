@@ -86,6 +86,11 @@ struct GeGpuDrawDescriptor {
     bool clear_color{};
     bool clear_alpha{};
     bool clear_depth{};
+    bool color_test_enabled{};
+    std::uint32_t color_test_function{};
+    std::uint32_t color_test_reference{};
+    std::uint32_t color_test_mask{0xFFFFFFu};
+
 };
 
 struct GeGpuHardwareTransform {

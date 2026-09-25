@@ -38,10 +38,8 @@ target_include_directories(lcs_generated PRIVATE
     "${REPO_ROOT}/include"
     "${REPO_ROOT}/lcs/host"
 )
-# Iteration APK: keep the huge generated AOT corpus at O1 so ccache can
-# reuse the validated mobile objects. The software GE itself is still O3+NEON,
-# which is the dominant performance target in this build.
-target_compile_options(lcs_generated PRIVATE -O1 -g0 -fexceptions -frtti)
+# Optimized guest AOT code. Preserve IEEE semantics: no guest fast-math.
+target_compile_options(lcs_generated PRIVATE -O2 -g0 -fexceptions -frtti)
 target_compile_definitions(lcs_generated PRIVATE
     PSPRECOMP_AOT_ASSUME_NO_WRITE_WATCH=1
     PSPRECOMP_AOT_PRODUCTION_FASTPATHS=1

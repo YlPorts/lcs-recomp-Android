@@ -3097,6 +3097,7 @@ Color gpu_texture_debug_color(const GeGpuDrawDescriptor &draw, Color lighting) n
 GeGpuDrawDescriptor gpu_effective_draw_descriptor(GeGpuDrawDescriptor draw) noexcept {
     if (!draw.clear_mode) return draw;
     draw.texture_enabled = false;
+    draw.color_test_enabled = false;
     draw.blend_enabled = false;
     draw.alpha_test_enabled = false;
     draw.fog_enabled = false;
@@ -4012,6 +4013,11 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
                 cached_draw_revision = draw_state_revision;
             }
         }
+        // Read these independently of cached descriptor revisions.
+        gpu_draw.color_test_enabled = (data24(commands[0x27u]) & 1u) != 0u;
+        gpu_draw.color_test_function = data24(commands[0xD8u]) & 3u;
+        gpu_draw.color_test_reference = data24(commands[0xD9u]) & 0xFFFFFFu;
+        gpu_draw.color_test_mask = data24(commands[0xDAu]) & 0xFFFFFFu;
         gpu_draw.primitive = primitive;
         gpu_draw.vertex_count = count;
 
@@ -4563,8 +4569,20 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         vertices.reserve(count);
         const IndexStreamReader draw_indices =
             make_index_reader(memory, index_address, layout.index_type, count);
+        static thread_local std::array<Vertex, 256> reuse_vertices;
+        std::array<std::uint32_t, 256> reuse_indices{};
+        std::array<bool, 256> reuse_valid{};
+        const bool reuse_indexed = gpu_backend_enabled && layout.index_type != 0u;
         for (std::uint32_t i = 0u; i < count; ++i) {
             const std::uint32_t index = draw_indices(i);
+            const auto slot = index & 255u;
+            if (reuse_indexed && reuse_valid[slot] && reuse_indices[slot] == index) {
+                const Vertex &vertex = reuse_vertices[slot];
+                record_clip_vertex(stats, vertex);
+                if (layout.through) record_screen_vertex(stats, vertex);
+                vertices.push_back(vertex);
+                continue;
+            }
             Vertex vertex{};
             if (!decode_vertex_optimized(memory, vertex_address + index * layout.stride, layout,
                                          commands, transform, vertex, error)) return false;
@@ -4575,6 +4593,11 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             // making characters/cars look fat.
             if (!layout.through) apply_android_3d_ultrawide(vertex);
 #endif
+            if (reuse_indexed) {
+                reuse_vertices[slot] = vertex;
+                reuse_indices[slot] = index;
+                reuse_valid[slot] = true;
+            }
             record_clip_vertex(stats, vertex);
             if (layout.through) record_screen_vertex(stats, vertex);
             vertices.push_back(vertex);
