@@ -2,6 +2,7 @@
 
 #include "android_host.hpp"
 #include "android_debug.hpp"
+#include "ge_gpu_backend.hpp"
 #include "lcs_controls.hpp"
 #include "lcs_render_config.hpp"
 
@@ -265,7 +266,11 @@ void display_window_init() {
     g_stop_requested.store(false, std::memory_order_relaxed);
 }
 
-void display_window_attach_gpu_backend() {}
+void display_window_attach_gpu_backend() {
+    std::lock_guard<std::mutex> guard(g_surface_mutex);
+    apply_pending_surface_locked();
+    ge_gpu_backend_set_native_window(g_window);
+}
 
 bool display_window_profile_key_pressed() { return false; }
 
@@ -341,6 +346,7 @@ void display_window_present_rgba(std::span<const std::byte> rgba,
 }
 
 void display_window_shutdown() {
+    ge_gpu_backend_set_native_window(nullptr);
     std::lock_guard<std::mutex> guard(g_surface_mutex);
     if (g_window != nullptr) {
         ANativeWindow_release(g_window);
