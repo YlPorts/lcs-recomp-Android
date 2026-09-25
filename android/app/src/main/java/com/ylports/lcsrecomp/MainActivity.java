@@ -9,6 +9,8 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
 import android.os.SystemClock;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.OpenableColumns;
 import android.view.Gravity;
 import android.view.SurfaceHolder;
@@ -44,10 +46,25 @@ public final class MainActivity extends Activity {
                                       int cameraX, int cameraY,
                                       boolean accelerate, boolean brake);
     static native void nativeRequestStop();
+    static native String nativeGetDebugStatus();
 
     private TextView statusView;
     private Button playButton;
     private Button elfButton;
+    private TextView debugView;
+    private final Handler debugHandler = new Handler(Looper.getMainLooper());
+    private final Runnable debugPoll = new Runnable() {
+        @Override
+        public void run() {
+            if (!inGame || debugView == null || destroyed) return;
+            try {
+                debugView.setText(nativeGetDebugStatus());
+            } catch (Throwable error) {
+                debugView.setText("DIAG error: " + error.getClass().getSimpleName());
+            }
+            debugHandler.postDelayed(this, 500L);
+        }
+    };
     private volatile Thread gameThread;
     private volatile boolean inGame;
     private boolean destroyed;
@@ -90,6 +107,8 @@ public final class MainActivity extends Activity {
 
     private void showLauncher(String message) {
         inGame = false;
+        debugHandler.removeCallbacks(debugPoll);
+        debugView = null;
         enterImmersiveMode();
 
         LinearLayout root = new LinearLayout(this);
@@ -559,7 +578,24 @@ public final class MainActivity extends Activity {
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
 
+        debugView = new TextView(this);
+        debugView.setText("LCS Android 0.3 DIAG\nstarting...");
+        debugView.setTextColor(Color.WHITE);
+        debugView.setTextSize(10f);
+        debugView.setPadding(12, 8, 12, 8);
+        debugView.setBackgroundColor(Color.argb(155, 0, 0, 0));
+        debugView.setGravity(Gravity.START);
+        FrameLayout.LayoutParams debugParams = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP | Gravity.START);
+        debugParams.leftMargin = 16;
+        debugParams.topMargin = 16;
+        root.addView(debugView, debugParams);
+
         setContentView(root);
+        debugHandler.removeCallbacks(debugPoll);
+        debugHandler.post(debugPoll);
 
         SurfaceHolder holder = surfaceView.getHolder();
         holder.addCallback(new SurfaceHolder.Callback() {
@@ -614,6 +650,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         destroyed = true;
+        debugHandler.removeCallbacks(debugPoll);
         nativeRequestStop();
         nativeSetSurface(null);
         super.onDestroy();
