@@ -155,10 +155,10 @@ std::string status_text(std::uint32_t pc, std::int32_t thread_uid,
         << "x" << g_last_present_height.load(std::memory_order_relaxed)
         << "  nonBlack=" << non_black << "/" << total;
 
-    out << "\nEGL=" << (g_egl_ready.load(std::memory_order_relaxed) ? "OK" : "NO")
+    out << "\nNATIVE=" << (g_egl_ready.load(std::memory_order_relaxed) ? "OK" : "NO")
         << "  swaps=" << g_swaps.load(std::memory_order_relaxed)
         << "  swapFail=" << g_swap_failures.load(std::memory_order_relaxed)
-        << "  eglFail=" << g_egl_failures.load(std::memory_order_relaxed);
+        << "  nativeFail=" << g_egl_failures.load(std::memory_order_relaxed);
 
     if (stage == Stage::Finished)
         out << "\nresult=" << g_result.load(std::memory_order_relaxed);
