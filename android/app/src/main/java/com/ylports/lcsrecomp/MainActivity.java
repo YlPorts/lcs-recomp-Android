@@ -131,7 +131,7 @@ public final class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView info = new TextView(this);
-        info.setText("v0.2 · ARM64 experimental\nSelecciona directamente tu ISO de GTA: Liberty City Stories\nUS v1.05 · ULUS-10041");
+        info.setText("v0.6.2 · GLES stability\nGTA: Liberty City Stories · ULUS-10041 v1.05");
         info.setTextColor(Color.LTGRAY);
         info.setTextSize(15f);
         info.setGravity(Gravity.CENTER);
@@ -159,6 +159,22 @@ public final class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT);
         statusParams.topMargin = 18;
         root.addView(statusView, statusParams);
+
+        String previousCrash = loadPreviousCrashReport();
+        if (previousCrash != null && !previousCrash.isEmpty()) {
+            TextView crashView = new TextView(this);
+            crashView.setText(previousCrash);
+            crashView.setTextColor(Color.rgb(255, 210, 140));
+            crashView.setTextSize(10f);
+            crashView.setTextIsSelectable(true);
+            crashView.setPadding(14, 10, 14, 10);
+            crashView.setBackgroundColor(Color.rgb(34, 26, 18));
+            LinearLayout.LayoutParams crashParams = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT);
+            crashParams.topMargin = 14;
+            root.addView(crashView, crashParams);
+        }
 
         LinearLayout buttons = new LinearLayout(this);
         buttons.setOrientation(LinearLayout.HORIZONTAL);
@@ -195,6 +211,40 @@ public final class MainActivity extends Activity {
 
         root.addView(buttons, buttonsParams);
         setContentView(root);
+    }
+
+    private String loadPreviousCrashReport() {
+        File marker = new File(getFilesDir(), "native_crash.txt");
+        File runtimeLog = new File(gameDirectory(), "android_runtime.log");
+        if (!marker.isFile() && !runtimeLog.isFile()) return null;
+
+        StringBuilder report = new StringBuilder();
+        report.append("ÚLTIMO CIERRE NATIVO\n");
+        try {
+            if (marker.isFile()) {
+                String signal = new String(Files.readAllBytes(marker.toPath()),
+                        StandardCharsets.UTF_8).trim();
+                report.append("Señal: ").append(signal.isEmpty() ? "(sin nombre)" : signal)
+                        .append('\n');
+            } else {
+                report.append("Señal: no registrada\n");
+            }
+        } catch (IOException ex) {
+            report.append("Señal: error leyendo marcador\n");
+        }
+
+        if (runtimeLog.isFile()) {
+            try {
+                byte[] data = Files.readAllBytes(runtimeLog.toPath());
+                int keep = Math.min(data.length, 6000);
+                int start = data.length - keep;
+                String tail = new String(data, start, keep, StandardCharsets.UTF_8);
+                report.append("\nÚltimas líneas:\n").append(tail);
+            } catch (IOException ex) {
+                report.append("\nNo se pudo leer android_runtime.log.");
+            }
+        }
+        return report.toString();
     }
 
     private void chooseGameIso() {
@@ -602,7 +652,7 @@ public final class MainActivity extends Activity {
                 + "ShowFPS=false\n\n"
                 + "[Rendering]\n"
                 + "InternalResolutionMode=Scale\n"
-                + "InternalScale=2\n"
+                + "InternalScale=1\n"
                 + "MSAA=1\n"
                 + "HardwareTransform=true\n\n"
                 + "[Audio]\n"
