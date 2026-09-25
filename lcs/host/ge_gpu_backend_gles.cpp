@@ -1759,6 +1759,8 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
                              s.texture_cache_bytes / (1024u * 1024u)) +
                          " draws=" + std::to_string(s.report.game_draw_calls) +
                          " texUploads=" + std::to_string(s.report.decoded_texture_uploads) +
+                         " cacheHits=" + std::to_string(s.report.texture_cache_hits) +
+                         " evictions=" + std::to_string(s.report.evicted_textures) +
                          " texMB=" + std::to_string(
                              s.report.decoded_texture_bytes / (1024u * 1024u)));
         if ((s.frame_epoch % 120u) == 0u) {
