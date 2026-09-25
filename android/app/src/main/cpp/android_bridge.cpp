@@ -79,6 +79,11 @@ Java_com_ylports_lcsrecomp_MainActivity_nativeRun(
     setenv("PSPRECOMP_INTERNAL_HEIGHT", "272", 1);
     setenv("PSPRECOMP_AUDIO", "0", 1);
 
+    // FFmpeg/PMF decoding is not linked in the Android bootstrap yet. Tell the
+    // HLE to reject MPEG creation immediately so startup movies are skipped
+    // instead of repeatedly waiting on a decoder that can never produce a frame.
+    setenv("LCS_SKIP_MPEG", "1", 1);
+
     // Keep rendering deterministic on mobile while the native Android backend
     // is being validated.  The software GE and presentation both touch PSP
     // framebuffer memory; synchronous execution avoids racing guest writes.
