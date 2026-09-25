@@ -82,10 +82,17 @@ Java_com_ylports_lcsrecomp_MainActivity_nativeRun(
     if (!config_path.empty())
         setenv("PSPRECOMP_CONFIG", config_path.c_str(), 1);
 
-    // Android bring-up currently uses the CPU/software GE path.
-    setenv("PSPRECOMP_GE_BACKEND", "software", 1);
-    setenv("PSPRECOMP_INTERNAL_WIDTH", "480", 1);
-    setenv("PSPRECOMP_INTERNAL_HEIGHT", "272", 1);
+    // Android GPU path: PSP GE commands are translated to OpenGL ES 3.
+    // Software rasterization is disabled once the mobile GPU backend owns the
+    // framebuffer, which removes the main ~5 FPS CPU bottleneck.
+    setenv("PSPRECOMP_GE_BACKEND", "gles", 1);
+    setenv("PSPRECOMP_GE_GPU_SKIP_SOFTWARE_RASTER", "1", 1);
+    setenv("PSPRECOMP_GE_GPU_HW_TRANSFORM", "1", 1);
+    setenv("PSPRECOMP_GE_DIRECT_NONINDEXED_DRAW", "1", 1);
+    setenv("PSPRECOMP_GLES_SCALE", "2", 1);
+    setenv("LCS_FPS_CAP", "60", 1);
+    setenv("PSPRECOMP_INTERNAL_WIDTH", "960", 1);
+    setenv("PSPRECOMP_INTERNAL_HEIGHT", "544", 1);
     setenv("PSPRECOMP_AUDIO", "1", 1);
 
     // FFmpeg/PMF decoding is not linked in the Android bootstrap yet. Tell the
