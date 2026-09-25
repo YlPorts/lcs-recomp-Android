@@ -354,7 +354,11 @@ void main() {
     vec4 color = clamp(vColor, 0.0, 1.0);
     if (uTextureEnabled != 0) {
         float q = abs(vQ) < 1.0e-20 ? 1.0 : vQ;
-        vec4 texel = texture(uTexture, vUv / q);
+        vec2 sampleUv = vUv / q;
+        // PSP/D3D texture space has its origin at the top-left; OpenGL ES
+        // samples from the bottom-left, so flip V at the sampling boundary.
+        sampleUv.y = 1.0 - sampleUv.y;
+        vec4 texel = texture(uTexture, sampleUv);
         int fn = uTextureFunction & 7;
         if (fn == 0) {
             color.rgb *= texel.rgb;
@@ -768,10 +772,18 @@ void set_transform_uniforms(
     const auto clip_y = transform_row(hw, 1u);
     const auto clip_z = transform_row(hw, 2u);
     const auto clip_w = transform_row(hw, 3u);
-    const float x_a = hw.viewport_scale_x *
+    float x_a = hw.viewport_scale_x *
         (2.0f / static_cast<float>(std::max<std::uint32_t>(1u, logical_width)));
-    const float x_b = (hw.viewport_center_x - hw.viewport_offset_x) *
+    float x_b = (hw.viewport_center_x - hw.viewport_offset_x) *
         (2.0f / static_cast<float>(std::max<std::uint32_t>(1u, logical_width))) - 1.0f;
+    // Match the CPU ultrawide correction when hardware transform is enabled:
+    // compress clip X before the final SurfaceView stretch, yielding extra
+    // horizontal field of view instead of stretched geometry.
+    const float ultrawide = android_host::ultrawide_x_scale();
+    if (std::isfinite(ultrawide) && ultrawide > 0.0f) {
+        x_a *= ultrawide;
+        x_b *= ultrawide;
+    }
     const float y_a = hw.viewport_scale_y *
         (2.0f / static_cast<float>(std::max<std::uint32_t>(1u, logical_height)));
     const float y_b = (hw.viewport_center_y - hw.viewport_offset_y) *
@@ -1234,7 +1246,7 @@ bool ge_gpu_backend_texture_available(
 
     const auto target =
         s.targets.find(draw.texture_address & 0x001FFFF0u);
-    if (target != s.targets.end() && target->second.color != 0u) return true;
+    if (target != s.targets.end()) return true;
 
     const auto found = s.textures.find(texture_key(draw));
     if (found == s.textures.end() || found->second.id == 0u) return false;
@@ -1490,7 +1502,10 @@ bool ge_gpu_backend_copy_game_frame_rgba(
 
 bool ge_gpu_backend_presents_directly() noexcept {
     const GlesState &s = state();
-    return s.enabled && s.direct_present_ok;
+    // Once EGL owns the Android window, never fall back to ANativeWindow_lock
+    // presentation on the same surface. The first GPU frame may still be
+    // building, but presentation remains GPU-owned.
+    return s.enabled && s.surface != EGL_NO_SURFACE;
 }
 
 std::uint32_t ge_gpu_backend_owned_framebuffer() noexcept {
