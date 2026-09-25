@@ -523,9 +523,15 @@ namespace {
 constexpr std::uint32_t kSampleRate = StreamingLinearResampler::kOutputRate;
 constexpr std::uint32_t kOutputChannels = 2u;
 constexpr std::size_t kGuestChannels = 9u;
-constexpr std::size_t kRingFrames = kSampleRate * 2u;
-constexpr std::uint64_t kLeadFrames = 2048u;
-constexpr std::uint64_t kChannelDiscontinuityFrames = 512u;
+constexpr std::size_t kRingFrames = kSampleRate * 3u;
+// ~185 ms of safety buffering. The GLES backend now hits real time in many
+// scenes but still has occasional heavy frames; a larger lead avoids audible
+// underruns without changing emulation timing.
+constexpr std::uint64_t kLeadFrames = 8192u;
+// Do not reset the resampler for small scheduling jitter. The old 512-frame
+// threshold (~12 ms) caused repeated resets whenever a single render frame ran
+// long. ~93 ms absorbs transient stalls much more gracefully.
+constexpr std::uint64_t kChannelDiscontinuityFrames = 4096u;
 
 struct ChannelStream {
     StreamingLinearResampler resampler;
