@@ -763,6 +763,8 @@ bool ensure_target(GlesState &s, GlesTarget &target, std::string &error) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
                  static_cast<GLsizei>(render_width),
                  static_cast<GLsizei>(render_height),
@@ -988,6 +990,8 @@ GLuint texture_for_draw(GlesState &s, const GeGpuDrawDescriptor &draw,
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
                              static_cast<GLsizei>(source.render_width),
                              static_cast<GLsizei>(source.render_height),
@@ -1019,7 +1023,10 @@ void configure_texture_sampling(const GeGpuDrawDescriptor &draw, GLuint texture)
                     draw.texture_clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT);
 
     GLint min_filter = draw.texture_min_linear ? GL_LINEAR : GL_NEAREST;
-    if (draw.texture_mipmap_enabled) {
+    // PSP may request mip filtering with a one-level texture. GLES is strict
+    // about texture completeness, so only select a mip filter when at least one
+    // additional mip level is declared.
+    if (draw.texture_mipmap_enabled && draw.texture_max_level > 0u) {
         if (draw.texture_mipmap_linear) {
             min_filter = draw.texture_min_linear
                 ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_LINEAR;
@@ -1176,7 +1183,22 @@ bool present_target(GlesState &s, GlesTarget &target, std::string &error) {
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
     if (eglSwapBuffers(s.display, s.surface) != EGL_TRUE) {
-        error = egl_error("eglSwapBuffers");
+        const EGLint swap_error = eglGetError();
+        if (swap_error == EGL_BAD_SURFACE || swap_error == EGL_BAD_NATIVE_WINDOW) {
+            runtime_log_line("gles: Android surface lost; waiting for replacement");
+            (void)eglMakeCurrent(
+                s.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            if (s.surface != EGL_NO_SURFACE)
+                (void)eglDestroySurface(s.display, s.surface);
+            s.surface = EGL_NO_SURFACE;
+            s.surface_dirty.store(true, std::memory_order_release);
+            s.direct_present_ok = false;
+            return false;
+        }
+        char buffer[96]{};
+        std::snprintf(buffer, sizeof(buffer), "eglSwapBuffers (EGL=0x%04X)",
+                      static_cast<unsigned>(swap_error));
+        error = buffer;
         return false;
     }
 
@@ -1534,6 +1556,9 @@ bool ge_gpu_backend_upload_decoded_texture_chain_packed(
         ++s.report.uploaded_mip_levels;
     }
 
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL,
+                    static_cast<GLint>(mip_levels - 1u));
     configure_texture_sampling(draw, texture.id);
     texture.width = base_width;
     texture.height = base_height;
@@ -1622,12 +1647,32 @@ bool append_or_merge_color_batch(
     GlesState &s,
     const GeGpuDrawDescriptor &draw,
     std::span<const GeGpuVertex> vertices) {
+    const bool sampled_texture =
+        draw.texture_enabled && ge_gpu_backend_texture_available(draw);
+    const bool normalize_uv =
+        sampled_texture && draw.texture_width != 0u && draw.texture_height != 0u;
+    const float inv_width = normalize_uv
+        ? 1.0f / static_cast<float>(draw.texture_width) : 1.0f;
+    const float inv_height = normalize_uv
+        ? 1.0f / static_cast<float>(draw.texture_height) : 1.0f;
+
+    const auto append_vertices = [&](std::vector<GeGpuVertex> &destination) {
+        const std::size_t first = destination.size();
+        destination.insert(destination.end(), vertices.begin(), vertices.end());
+        if (normalize_uv) {
+            for (std::size_t i = first; i < destination.size(); ++i) {
+                destination[i].u *= inv_width;
+                destination[i].v *= inv_height;
+            }
+        }
+    };
+
     if (!s.batches.empty()) {
         GlesBatch &last = s.batches.back();
         if (!last.hardware_transform && last.indices.empty() &&
             gles_draw_state_compatible(last.draw, draw)) {
             try {
-                last.vertices.insert(last.vertices.end(), vertices.begin(), vertices.end());
+                append_vertices(last.vertices);
                 return true;
             } catch (...) {
                 return false;
@@ -1638,7 +1683,7 @@ bool append_or_merge_color_batch(
     try {
         GlesBatch batch{};
         batch.draw = draw;
-        batch.vertices.assign(vertices.begin(), vertices.end());
+        append_vertices(batch.vertices);
         s.batches.push_back(std::move(batch));
         return true;
     } catch (...) {
