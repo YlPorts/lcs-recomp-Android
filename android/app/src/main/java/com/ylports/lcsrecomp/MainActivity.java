@@ -1,12 +1,15 @@
 package com.ylports.lcsrecomp;
 
 import android.app.Activity;
+import android.app.ActivityManager;
+import android.app.ApplicationExitInfo;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.database.Cursor;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Build;
 import android.os.ParcelFileDescriptor;
 import android.os.SystemClock;
 import android.os.Handler;
@@ -34,6 +37,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.channels.FileChannel;
 import java.util.Locale;
+import java.util.List;
 
 public final class MainActivity extends Activity {
     private static final int REQUEST_GAME_ISO = 1001;
@@ -216,10 +220,12 @@ public final class MainActivity extends Activity {
     private String loadPreviousCrashReport() {
         File marker = new File(getFilesDir(), "native_crash.txt");
         File runtimeLog = new File(gameDirectory(), "android_runtime.log");
-        if (!marker.isFile() && !runtimeLog.isFile()) return null;
+        String systemExit = loadSystemExitInfo();
+        if (!marker.isFile() && !runtimeLog.isFile() && systemExit == null) return null;
 
         StringBuilder report = new StringBuilder();
-        report.append("ÚLTIMO CIERRE NATIVO\n");
+        report.append("ÚLTIMO CIERRE / DIAGNÓSTICO\n");
+        if (systemExit != null) report.append(systemExit).append('\n');
         try {
             if (marker.isFile()) {
                 String signal = new String(Files.readAllBytes(marker.toPath()),
@@ -245,6 +251,31 @@ public final class MainActivity extends Activity {
             }
         }
         return report.toString();
+    }
+
+    private String loadSystemExitInfo() {
+        if (Build.VERSION.SDK_INT < 30) return null;
+        try {
+            ActivityManager manager = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+            if (manager == null) return null;
+            List<ApplicationExitInfo> exits =
+                    manager.getHistoricalProcessExitReasons(getPackageName(), 0, 3);
+            if (exits == null || exits.isEmpty()) return null;
+
+            ApplicationExitInfo info = exits.get(0);
+            String description = info.getDescription();
+            StringBuilder out = new StringBuilder();
+            out.append("Android exit reason=").append(info.getReason())
+                    .append(" status=").append(info.getStatus())
+                    .append(" importance=").append(info.getImportance())
+                    .append(" PSS=").append(info.getPss() / 1024).append(" MB")
+                    .append(" RSS=").append(info.getRss() / 1024).append(" MB");
+            if (description != null && !description.isEmpty())
+                out.append("\nDescripción: ").append(description);
+            return out.toString();
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     private void chooseGameIso() {
