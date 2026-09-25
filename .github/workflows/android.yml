@@ -3,24 +3,14 @@ name: Android APK
 on:
   push:
     branches: [android-port]
-    paths:
-      - "android/**"
-      - "lcs/**"
-      - "src/**"
-      - "include/**"
-      - ".github/workflows/android.yml"
+    paths: ["android/**", "lcs/**", "src/**", "include/**", ".github/workflows/android.yml"]
   pull_request:
     branches: [main]
-    paths:
-      - "android/**"
-      - "lcs/**"
-      - "src/**"
-      - "include/**"
-      - ".github/workflows/android.yml"
+    paths: ["android/**", "lcs/**", "src/**", "include/**", ".github/workflows/android.yml"]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: lcs-android-${{ github.ref }}
@@ -29,40 +19,83 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-
+    timeout-minutes: 90
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Apply checked 0.6.8 source fixes
+        run: python3 android/tools/repair_068.py
+
+      - name: Component regression tests
+        run: |
+          mkdir -p android/test-results
+          g++ -std=c++20 -O2 -pthread -Wall -Wextra -Werror -I lcs/host android/tests/android_regression.cpp -o /tmp/lcs-android-regression
+          /tmp/lcs-android-regression | tee android/test-results/components.txt
+          g++ -std=c++20 -O1 -g -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -I lcs/host android/tests/android_regression.cpp -o /tmp/lcs-android-sanitized
+          /tmp/lcs-android-sanitized | tee android/test-results/sanitizers.txt
+
+      - name: Validate GLES shaders
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y glslang-tools ccache
+          python3 - <<'PY'
+          import pathlib,re,subprocess
+          text=pathlib.Path('lcs/host/ge_gpu_backend_gles.cpp').read_text()
+          shaders=re.findall(r'static constexpr char (\w+)\[\] = R"GLSL\((.*?)\)GLSL";',text,re.S)
+          assert len(shaders)==4, len(shaders)
+          for name,source in shaders:
+              stage='vert' if 'Vertex' in name else 'frag'
+              path=pathlib.Path('android/test-results')/(name+'.'+stage)
+              path.write_text(source)
+              subprocess.run(['glslangValidator','-S',stage,str(path)],check=True)
+          print('PASS: four actual GLES 3 shader sources validated')
+          PY
+
+      - name: Commit tested source fixes
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/android-port'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add lcs/host/ge_gpu_backend.hpp lcs/host/ge_gpu_backend_gles.cpp lcs/host/ge_renderer.cpp lcs/host/lcs_audio_output.cpp lcs/host/lcs_android_gpu_policy.hpp lcs/host/lcs_android_audio_queue.hpp lcs/host/lcs_audio_output_android.inc android/app/build.gradle android/app/src/main/cpp/CMakeLists.txt android/app/src/main/java/com/ylports/lcsrecomp/MainActivity.java android/tests/android_regression.cpp android/REPAIR_068.md
+          if ! git diff --cached --quiet; then
+            git commit -m "Apply tested GLES texture, depth and timed PCM fixes for Android 0.6.8 [skip ci]"
+            git push origin HEAD:android-port
+          fi
+
+      - name: Record exact source and test results
+        run: |
+          git rev-parse HEAD > android/test-results/source-commit.txt
+          git archive --format=tar.gz -o /tmp/LCSRecomp-Android-source.tar.gz HEAD
+      - name: Upload source and tests
+        uses: actions/upload-artifact@v4
+        with:
+          name: LCSRecomp-Android-source-and-tests
+          path: |
+            /tmp/LCSRecomp-Android-source.tar.gz
+            android/test-results/
 
       - name: Java 17
         uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
-
       - name: Android SDK
         uses: android-actions/setup-android@v4
         with:
           packages: ""
-
       - name: Install Android toolchain
-        run: |
-          sdkmanager "platforms;android-35" "build-tools;35.0.0" \
-            "ndk;27.2.12479018" "cmake;3.22.1"
-
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
       - name: Gradle 8.10.2
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.10.2"
-
-      - name: Install ccache
+      - name: Configure ccache
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y ccache
           ccache --max-size=2G
           ccache --zero-stats
-
       - name: Restore native compiler cache
         id: ccache
         uses: actions/cache/restore@v5
@@ -71,24 +104,20 @@ jobs:
           key: lcs-android-ccache-${{ runner.os }}-${{ hashFiles('android/app/src/main/cpp/CMakeLists.txt', 'include/**', 'src/**', 'lcs/host/**', 'lcs/generated/**') }}
           restore-keys: |
             lcs-android-ccache-${{ runner.os }}-
-
       - name: Build ARM64 debug APK
-        run: gradle -p android :app:assembleDebug --no-daemon --stacktrace
-
+        run: gradle -p android :app:assembleDebug --no-daemon --max-workers=2 --stacktrace
       - name: Save native compiler cache
-        if: always()
+        if: always() && steps.ccache.outputs.cache-primary-key != ''
         uses: actions/cache/save@v5
         with:
           path: /home/runner/.cache/ccache
           key: ${{ steps.ccache.outputs.cache-primary-key }}
-
       - name: ccache stats
         if: always()
         run: ccache --show-stats || true
-
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-arm64-debug
+          name: LCSRecomp-Android-0.6.8-arm64-debug
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
