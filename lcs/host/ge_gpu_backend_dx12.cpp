@@ -3279,7 +3279,7 @@ bool ge_gpu_backend_copy_offscreen_rgba(std::span<std::byte> destination) noexce
 void ge_gpu_backend_mark_window_presented() noexcept { state().report.gpu_frame_presented_to_window = true; }
 GeGpuBackendReport ge_gpu_backend_report() { return state().report; }
 
-#else
+#elif !defined(__ANDROID__)
 
 namespace {
 struct Dx12StubState { GeGpuBackendReport report{}; std::uint32_t display_framebuffer{}; };
@@ -3338,6 +3338,7 @@ const char *ge_gpu_backend_name(GeGpuBackendKind kind) noexcept {
     switch (kind) {
     case GeGpuBackendKind::Software: return "software";
     case GeGpuBackendKind::DirectX12: return "directx12";
+    case GeGpuBackendKind::OpenGLES: return "opengles";
     }
     return "unknown";
 }
