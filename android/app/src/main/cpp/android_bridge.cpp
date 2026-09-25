@@ -1,5 +1,6 @@
 #include "android_host.hpp"
 #include "android_debug.hpp"
+#include "ge_gpu_backend.hpp"
 #include "psprecomp/runtime.hpp"
 
 #include <android/native_window_jni.h>
@@ -83,6 +84,10 @@ Java_com_ylports_lcsrecomp_MainActivity_nativeSetSurface(
     JNIEnv *env, jclass, jobject surface) {
     ANativeWindow *window = surface != nullptr ? ANativeWindow_fromSurface(env, surface) : nullptr;
     lcs::android_host::set_window(window);
+    // Keep EGL attached to the current SurfaceView buffer queue. Retaining an
+    // old ANativeWindow across SurfaceView recreation can crash inside the Mali
+    // GLES driver even though the pointer still has a reference.
+    lcs::ge_gpu_backend_set_native_window(window);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -144,7 +149,11 @@ Java_com_ylports_lcsrecomp_MainActivity_nativeRun(
     // framebuffer, which removes the main ~5 FPS CPU bottleneck.
     setenv("PSPRECOMP_GE_BACKEND", "gles", 1);
     setenv("PSPRECOMP_GE_GPU_SKIP_SOFTWARE_RASTER", "1", 1);
-    setenv("PSPRECOMP_GE_GPU_HW_TRANSFORM", "1", 1);
+    // Keep rasterization on the GPU, but use the already-proven CPU vertex
+    // transform path for this stability build. The first crash reports show all
+    // 2D GPU frames presenting correctly and the process dying when 3D starts,
+    // making the experimental hardware-transform path the prime suspect.
+    setenv("PSPRECOMP_GE_GPU_HW_TRANSFORM", "0", 1);
     setenv("PSPRECOMP_GE_DIRECT_NONINDEXED_DRAW", "1", 1);
     setenv("PSPRECOMP_GLES_SCALE", "1", 1);
     setenv("LCS_FPS_CAP", "60", 1);
