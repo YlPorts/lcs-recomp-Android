@@ -156,7 +156,11 @@ Java_com_ylports_lcsrecomp_MainActivity_nativeRun(
     setenv("PSPRECOMP_GE_GPU_HW_TRANSFORM", "0", 1);
     setenv("PSPRECOMP_GE_DIRECT_NONINDEXED_DRAW", "1", 1);
     setenv("PSPRECOMP_GLES_SCALE", "1", 1);
-    setenv("LCS_FPS_CAP", "60", 1);
+    // LCS_FPS_CAP throttles changing GE LIST addresses, not finished frames.
+    // A game frame contains several lists; keep only the existing vblank
+    // real-time pacing instead of sleeping 16.67 ms per list as well.
+    setenv("LCS_FPS_CAP", "0", 1);
+    unsetenv("LCS_UNCAPPED");
     setenv("PSPRECOMP_INTERNAL_WIDTH", "480", 1);
     setenv("PSPRECOMP_INTERNAL_HEIGHT", "272", 1);
     setenv("PSPRECOMP_AUDIO", "1", 1);
