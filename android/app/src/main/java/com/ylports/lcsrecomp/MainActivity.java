@@ -28,7 +28,10 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.channels.FileChannel;
 import java.util.Locale;
 
@@ -284,12 +287,20 @@ public final class MainActivity extends Activity {
             }
 
             File param = findRelativeCaseInsensitive(pspGame, "PARAM.SFO");
-            boolean correctDisc = param != null
-                    && (fileContainsAscii(param, "ULUS10041")
-                    || fileContainsAscii(param, "ULUS-10041"));
-            if (!correctDisc) {
+            if (param == null)
+                throw new IOException("La ISO no contiene PSP_GAME/PARAM.SFO.");
+
+            String discId = readSfoString(param, "DISC_ID");
+            String discVersion = readSfoString(param, "DISC_VERSION");
+            if (!"ULUS10041".equalsIgnoreCase(discId != null ? discId.replace("-", "") : "")) {
                 throw new IOException(
-                        "La ISO no parece ser GTA LCS USA ULUS-10041. Este recompilado necesita esa versión.");
+                        "ISO incorrecta: DISC_ID=" + String.valueOf(discId)
+                                + ". Se necesita ULUS-10041.");
+            }
+            if (!"1.05".equals(discVersion)) {
+                throw new IOException(
+                        "Revisión incompatible: ULUS-10041 v" + String.valueOf(discVersion)
+                                + ". Este recompilado necesita exactamente v1.05.");
             }
 
             String executableStatus = prepareExecutable(staging, pspGame);
@@ -428,6 +439,48 @@ public final class MainActivity extends Activity {
         if (files == null) return null;
         for (File file : files)
             if (file.getName().equalsIgnoreCase(wanted)) return file;
+        return null;
+    }
+
+    private static String readSfoString(File file, String wantedKey) throws IOException {
+        byte[] data = Files.readAllBytes(file.toPath());
+        if (data.length < 20
+                || data[0] != 0x00 || data[1] != 0x50
+                || data[2] != 0x53 || data[3] != 0x46) {
+            throw new IOException("PARAM.SFO inválido.");
+        }
+
+        ByteBuffer buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
+        int keyTableOffset = buffer.getInt(8);
+        int dataTableOffset = buffer.getInt(12);
+        int entryCount = buffer.getInt(16);
+        if (keyTableOffset < 0 || dataTableOffset < 0 || entryCount < 0
+                || keyTableOffset >= data.length || dataTableOffset >= data.length
+                || 20L + (long) entryCount * 16L > data.length) {
+            throw new IOException("Tabla PARAM.SFO inválida.");
+        }
+
+        for (int i = 0; i < entryCount; i++) {
+            int entry = 20 + i * 16;
+            int keyOffset = buffer.getShort(entry) & 0xFFFF;
+            int valueLength = buffer.getInt(entry + 4);
+            int valueOffset = buffer.getInt(entry + 12);
+
+            int keyStart = keyTableOffset + keyOffset;
+            if (keyStart < 0 || keyStart >= data.length) continue;
+            int keyEnd = keyStart;
+            while (keyEnd < data.length && data[keyEnd] != 0) keyEnd++;
+            String key = new String(data, keyStart, keyEnd - keyStart, StandardCharsets.UTF_8);
+            if (!wantedKey.equals(key)) continue;
+
+            int valueStart = dataTableOffset + valueOffset;
+            if (valueStart < 0 || valueStart >= data.length || valueLength <= 0) return null;
+            int available = Math.min(valueLength, data.length - valueStart);
+            int valueEnd = valueStart;
+            int limit = valueStart + available;
+            while (valueEnd < limit && data[valueEnd] != 0) valueEnd++;
+            return new String(data, valueStart, valueEnd - valueStart, StandardCharsets.UTF_8);
+        }
         return null;
     }
 
