@@ -52,8 +52,35 @@ jobs:
         with:
           gradle-version: "8.10.2"
 
+      - name: Install ccache
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ccache
+          ccache --max-size=2G
+          ccache --zero-stats
+
+      - name: Restore native compiler cache
+        id: ccache
+        uses: actions/cache/restore@v5
+        with:
+          path: /home/runner/.cache/ccache
+          key: lcs-android-ccache-${{ runner.os }}-${{ hashFiles('android/app/src/main/cpp/CMakeLists.txt', 'include/**', 'src/**', 'lcs/host/**', 'lcs/generated/**') }}
+          restore-keys: |
+            lcs-android-ccache-${{ runner.os }}-
+
       - name: Build ARM64 debug APK
         run: gradle -p android :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Save native compiler cache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: /home/runner/.cache/ccache
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats || true
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
