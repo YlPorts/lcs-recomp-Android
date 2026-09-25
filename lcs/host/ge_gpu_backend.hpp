@@ -12,6 +12,7 @@ namespace lcs {
 enum class GeGpuBackendKind : std::uint8_t {
     Software,
     DirectX12,
+    OpenGLES,
 };
 
 struct GeGpuDrawDescriptor {
