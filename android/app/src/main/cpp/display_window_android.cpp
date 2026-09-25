@@ -118,21 +118,17 @@ void unpack_rgba(const std::uint8_t *source, std::uint32_t format,
     destination[3] = static_cast<std::uint8_t>(a);
 }
 
-void present_rgba_locked(std::span<const std::byte> rgba,
-                         std::uint32_t width, std::uint32_t height) {
+void present_rgba_rows_locked(const std::uint8_t *source,
+                              std::size_t source_stride_bytes,
+                              std::uint32_t width, std::uint32_t height) {
     apply_pending_surface_locked();
-    if (g_window == nullptr || width == 0u || height == 0u ||
-        rgba.size() < static_cast<std::size_t>(width) * height * 4u) {
+    if (g_window == nullptr || source == nullptr || width == 0u || height == 0u) {
         android_debug::note_egl_ready(false);
         return;
     }
 
     android_host::set_source_size(width, height);
 
-    // Keep the producer buffer at the game's native render resolution. The
-    // SurfaceView/SurfaceFlinger compositor performs the expensive upscale to
-    // the phone's physical resolution on the GPU. This avoids a full-screen
-    // CPU scaling pass every frame.
     if (g_buffer_geometry_width != width || g_buffer_geometry_height != height) {
         if (ANativeWindow_setBuffersGeometry(
                 g_window, static_cast<int32_t>(width), static_cast<int32_t>(height),
@@ -157,7 +153,6 @@ void present_rgba_locked(std::span<const std::byte> rgba,
     android_debug::note_egl_ready(true);
 
     auto *destination = static_cast<std::uint8_t *>(buffer.bits);
-    const auto *source = reinterpret_cast<const std::uint8_t *>(rgba.data());
     const std::size_t destination_row_bytes =
         static_cast<std::size_t>(buffer.stride) * 4u;
     const std::uint32_t copy_width = std::min<std::uint32_t>(
@@ -170,7 +165,7 @@ void present_rgba_locked(std::span<const std::byte> rgba,
         std::uint8_t *dst_row =
             destination + static_cast<std::size_t>(y) * destination_row_bytes;
         const std::uint8_t *src_row =
-            source + static_cast<std::size_t>(y) * width * 4u;
+            source + static_cast<std::size_t>(y) * source_stride_bytes;
         std::memcpy(dst_row, src_row, copy_bytes);
         if (destination_row_bytes > copy_bytes)
             std::memset(dst_row + copy_bytes, 0, destination_row_bytes - copy_bytes);
@@ -184,6 +179,14 @@ void present_rgba_locked(std::span<const std::byte> rgba,
     const bool posted = ANativeWindow_unlockAndPost(g_window) == 0;
     android_debug::note_swap(posted);
     if (!posted) log_error("ANativeWindow_unlockAndPost failed");
+}
+
+void present_rgba_locked(std::span<const std::byte> rgba,
+                         std::uint32_t width, std::uint32_t height) {
+    if (rgba.size() < static_cast<std::size_t>(width) * height * 4u) return;
+    present_rgba_rows_locked(
+        reinterpret_cast<const std::uint8_t *>(rgba.data()),
+        static_cast<std::size_t>(width) * 4u, width, height);
 }
 
 }  // namespace
@@ -301,8 +304,18 @@ void display_window_present(psprecomp::Runtime &runtime, std::uint32_t frame_buf
         return;
     }
 
+    // LCS uses 32-bit GU_PSM_8888 for its main color target. Fast-path that
+    // overwhelmingly common case directly from guest VRAM into the native
+    // buffer: no per-pixel conversion and no intermediate full-frame copy.
+    if (pixel_format == 3u) {
+        android_debug::note_present_pixels(
+            1u, static_cast<std::uint64_t>(width) * height);
+        std::lock_guard<std::mutex> guard(g_surface_mutex);
+        present_rgba_rows_locked(source, stride_bytes, width, height);
+        return;
+    }
+
     g_rgba.resize(static_cast<std::size_t>(width) * height * 4u);
-    std::uint64_t non_black = 0u;
     for (std::uint32_t y = 0u; y < height; ++y) {
         const std::uint8_t *row =
             source + static_cast<std::size_t>(y) * stride_bytes;
@@ -312,15 +325,8 @@ void display_window_present(psprecomp::Runtime &runtime, std::uint32_t frame_buf
                 (static_cast<std::size_t>(y) * width + x) * 4u;
             unpack_rgba(row + static_cast<std::size_t>(x) * bpp,
                         pixel_format, pixel);
-            if (pixel[0] != 0u || pixel[1] != 0u || pixel[2] != 0u)
-                ++non_black;
         }
     }
-
-    android_debug::note_present_pixels(
-        non_black,
-        static_cast<std::uint64_t>(width) *
-            static_cast<std::uint64_t>(height));
 
     const auto bytes =
         std::as_bytes(std::span<const std::uint8_t>(g_rgba));
