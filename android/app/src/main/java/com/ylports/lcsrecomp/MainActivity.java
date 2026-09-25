@@ -135,7 +135,7 @@ public final class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView info = new TextView(this);
-        info.setText("v0.6.2 · GLES stability\nGTA: Liberty City Stories · ULUS-10041 v1.05");
+        info.setText("v0.6.3 · GLES raster / CPU transform\nGTA: Liberty City Stories · ULUS-10041 v1.05");
         info.setTextColor(Color.LTGRAY);
         info.setTextSize(15f);
         info.setGravity(Gravity.CENTER);
@@ -685,7 +685,7 @@ public final class MainActivity extends Activity {
                 + "InternalResolutionMode=Scale\n"
                 + "InternalScale=1\n"
                 + "MSAA=1\n"
-                + "HardwareTransform=true\n\n"
+                + "HardwareTransform=false\n\n"
                 + "[Audio]\n"
                 + "Enabled=true\n"
                 + "Volume=100\n\n"
