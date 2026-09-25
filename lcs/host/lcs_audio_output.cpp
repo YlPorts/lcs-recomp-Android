@@ -544,7 +544,7 @@ struct AndroidAudioState {
     std::uint64_t guest_anchor_us{};
     bool timeline_anchored{};
     bool opened{};
-    bool failed{};
+    std::atomic<bool> failed{false};
     std::uint64_t overrun_frames{};
     std::uint64_t late_frames{};
 };
