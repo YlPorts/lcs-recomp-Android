@@ -7,6 +7,7 @@
 #include "ge_gpu_backend.hpp"
 #include "ge_renderer.hpp"
 #include "lcs_render_config.hpp"
+#include "lcs_runtime_log.hpp"
 
 #if defined(__ANDROID__)
 #include "android_debug.hpp"
@@ -55,6 +56,8 @@ int main(int argc, char **argv) {
             argc > 0 ? std::filesystem::absolute(argv[0], executable_error).parent_path()
                      : std::filesystem::current_path();
         lcs::initialize_lcs_render_configuration(executable_directory);
+        lcs::runtime_log_initialize(lcs::lcs_render_configuration());
+        lcs::runtime_log_line("main: configuration initialized");
 
         auto elf = psprecomp::Elf32Image::from_file(elf_path);
 #if defined(__ANDROID__)
@@ -92,10 +95,13 @@ int main(int argc, char **argv) {
         lcs::android_debug::set_stage(lcs::android_debug::Stage::ProfileInstalled);
 #endif
 
+        lcs::runtime_log_line("main: initializing GE GPU backend");
         std::string gpu_backend_error;
         if (!lcs::initialize_ge_gpu_backend(gpu_backend_error))
             std::cerr << "[ge] GPU backend unavailable: " << gpu_backend_error << "\n";
+        lcs::runtime_log_line("main: GE backend init returned");
         lcs::display_window_attach_gpu_backend();
+        lcs::runtime_log_line("main: native window attached to GE backend");
         const lcs::GeGpuBackendReport gpu_start = lcs::ge_gpu_backend_report();
         std::cerr << "[ge] backend requested=" << lcs::ge_gpu_backend_name(gpu_start.requested)
                   << " active=" << lcs::ge_gpu_backend_name(gpu_start.active)
@@ -116,7 +122,9 @@ int main(int argc, char **argv) {
 #if defined(__ANDROID__)
         lcs::android_debug::set_stage(lcs::android_debug::Stage::Running);
 #endif
+        lcs::runtime_log_line("main: entering recompiled game");
         runtime.run(entry, max_dispatches);
+        lcs::runtime_log_line("main: runtime.run returned");
         lcs::ge_worker_shutdown();
 
         if (runtime.stopped()) {
