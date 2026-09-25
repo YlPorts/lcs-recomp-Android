@@ -844,7 +844,8 @@ VSOut VSMain(VSIn input) {
 struct VSInPacked0115 {
     uint2 uv8 : TEXCOORD2;
     uint color5551 : COLOR1;
-    int2 positionXY : POSITION1;
+    int positionX : POSITION1;
+    int positionY : POSITION3;
     int positionZ : POSITION2;
 };
 float Expand5ToFloat(uint value) {
@@ -854,7 +855,7 @@ float Expand5ToFloat(uint value) {
 }
 VSOut VSMainPacked0115(VSInPacked0115 input) {
     VSOut o;
-    float3 model = float3(float2(input.positionXY), float(input.positionZ)) * (1.0 / 32768.0);
+    float3 model = float3(float(input.positionX), float(input.positionY), float(input.positionZ)) * (1.0 / 32768.0);
     float4 p = float4(model, 1.0);
     float clipW = dot(TransformRow3, p);
     if (abs(clipW) < 1.0e-12) clipW = 1.0;
@@ -1343,7 +1344,9 @@ ComPtr<ID3D12PipelineState> create_pipeline(Dx12GeState &s,
          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0u},
         {"COLOR", 1u, DXGI_FORMAT_R16_UINT, 0u, 2u,
          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0u},
-        {"POSITION", 1u, DXGI_FORMAT_R16G16_SINT, 0u, 4u,
+        {"POSITION", 1u, DXGI_FORMAT_R16_SINT, 0u, 4u,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0u},
+        {"POSITION", 3u, DXGI_FORMAT_R16_SINT, 0u, 6u,
          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0u},
         {"POSITION", 2u, DXGI_FORMAT_R16_SINT, 0u, 8u,
          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0u},
