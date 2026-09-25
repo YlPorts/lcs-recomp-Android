@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -501,12 +502,54 @@ std::filesystem::path Runtime::translate_path(const std::string &psp_path) const
     if (colon != std::string::npos) relative.erase(0, colon + 1u);
     while (!relative.empty() && (relative.front() == '/' || relative.front() == '\\')) relative.erase(relative.begin());
     std::replace(relative.begin(), relative.end(), '\\', '/');
+
     std::filesystem::path clean;
     for (const auto &part : std::filesystem::path(relative)) {
         if (part == "..") throw Error("Rejected PSP path traversal: " + psp_path);
         if (part != ".") clean /= part;
     }
-    return game_root_ / clean;
+
+    const std::filesystem::path direct = game_root_ / clean;
+    std::error_code exists_error;
+    if (std::filesystem::exists(direct, exists_error)) return direct;
+
+    // UMD ISO9660 directory identifiers are commonly upper-case, while games
+    // may request paths using their original case.  Windows hides this, but
+    // Android's filesystem is case-sensitive. Resolve each component with an
+    // ASCII case-insensitive fallback only when the exact path was absent.
+    const auto equal_ascii_case = [](std::string_view a, std::string_view b) noexcept {
+        if (a.size() != b.size()) return false;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            const auto ca = static_cast<unsigned char>(a[i]);
+            const auto cb = static_cast<unsigned char>(b[i]);
+            if (std::tolower(ca) != std::tolower(cb)) return false;
+        }
+        return true;
+    };
+
+    std::filesystem::path resolved = game_root_;
+    for (const auto &part : clean) {
+        const std::filesystem::path exact = resolved / part;
+        exists_error.clear();
+        if (std::filesystem::exists(exact, exists_error)) {
+            resolved = exact;
+            continue;
+        }
+
+        std::error_code iterate_error;
+        bool matched = false;
+        for (const auto &entry : std::filesystem::directory_iterator(resolved, iterate_error)) {
+            const std::string wanted = part.string();
+            const std::string actual = entry.path().filename().string();
+            if (equal_ascii_case(wanted, actual)) {
+                resolved = entry.path();
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) return direct;
+    }
+    return resolved;
 }
 
 void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
