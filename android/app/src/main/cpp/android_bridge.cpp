@@ -5,9 +5,11 @@
 #include <android/native_window_jni.h>
 #include <jni.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 #include <csignal>
+#include <signal.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
@@ -20,19 +22,20 @@ char g_crash_marker_path[768]{};
 
 void native_crash_handler(int signal_number) {
     const char *message = "native signal\n";
+    std::size_t message_length = 14u;
     switch (signal_number) {
-    case SIGSEGV: message = "SIGSEGV\n"; break;
-    case SIGABRT: message = "SIGABRT\n"; break;
-    case SIGBUS:  message = "SIGBUS\n";  break;
-    case SIGILL:  message = "SIGILL\n";  break;
-    case SIGFPE:  message = "SIGFPE\n";  break;
+    case SIGSEGV: message = "SIGSEGV\n"; message_length = 8u; break;
+    case SIGABRT: message = "SIGABRT\n"; message_length = 8u; break;
+    case SIGBUS:  message = "SIGBUS\n";  message_length = 7u; break;
+    case SIGILL:  message = "SIGILL\n";  message_length = 7u; break;
+    case SIGFPE:  message = "SIGFPE\n";  message_length = 7u; break;
     default: break;
     }
 
     if (g_crash_marker_path[0] != '\0') {
         const int fd = open(g_crash_marker_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
         if (fd >= 0) {
-            (void)write(fd, message, std::strlen(message));
+            (void)write(fd, message, message_length);
             (void)close(fd);
         }
     }
