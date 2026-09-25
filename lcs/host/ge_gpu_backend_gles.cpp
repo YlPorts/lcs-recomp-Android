@@ -63,6 +63,8 @@ struct GlesBatch {
     GeGpuDrawDescriptor draw{};
     std::vector<GeGpuVertex> vertices;
     std::vector<std::uint32_t> indices;
+    std::uint32_t first_vertex{};
+    std::uint32_t first_index{};
     bool hardware_transform{};
     GeGpuHardwareTransform transform{};
 };
@@ -124,6 +126,9 @@ struct GlesState {
     GLint u_present_tex{-1};
 
     std::unordered_map<std::uint64_t, GlesTexture> textures;
+    std::unordered_map<std::uint64_t, std::uint64_t> texture_signature_epochs;
+    std::vector<GeGpuVertex> frame_vertices;
+    std::vector<std::uint32_t> frame_indices;
     std::uint64_t texture_cache_bytes{};
     std::uint32_t texture_cache_entry_limit{8192u};
     std::uint64_t texture_cache_byte_limit{256ull * 1024ull * 1024ull};
@@ -244,6 +249,9 @@ void destroy_gl_objects(GlesState &s) noexcept {
         if (texture.id != 0u) glDeleteTextures(1, &texture.id);
     }
     s.textures.clear();
+    s.texture_signature_epochs.clear();
+    s.frame_vertices.clear();
+    s.frame_indices.clear();
     s.texture_cache_bytes = 0u;
     for (auto &[key, target] : s.targets) {
         (void)key;
@@ -666,6 +674,12 @@ std::uint64_t texture_key(const GeGpuDrawDescriptor &draw) noexcept {
     return key == 0u ? 1u : key;
 }
 
+std::uint64_t texture_lookup_key(const GeGpuDrawDescriptor &draw) noexcept {
+    const std::uint64_t base = texture_key(draw);
+    if (draw.texture_content_signature == 0u) return base;
+    return hash_mix(base, draw.texture_content_signature);
+}
+
 std::uint32_t read_texture_entry_limit() noexcept {
     const LcsConfiguration &config = lcs_render_configuration();
     std::uint32_t fallback = config.initialized
@@ -1008,7 +1022,7 @@ GLuint texture_for_draw(GlesState &s, const GeGpuDrawDescriptor &draw,
         return source.color;
     }
 
-    const auto found = s.textures.find(texture_key(draw));
+    const auto found = s.textures.find(texture_lookup_key(draw));
     if (found == s.textures.end() || found->second.id == 0u) return 0u;
     found->second.last_used_epoch = s.frame_epoch;
     return found->second.id;
@@ -1108,11 +1122,6 @@ bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
     set_pixel_uniforms(s, batch.draw, textured);
 
     glBindVertexArray(s.vao);
-    glBindBuffer(GL_ARRAY_BUFFER, s.vbo);
-    glBufferData(GL_ARRAY_BUFFER,
-                 static_cast<GLsizeiptr>(
-                     batch.vertices.size() * sizeof(GeGpuVertex)),
-                 batch.vertices.data(), GL_STREAM_DRAW);
 
     GLenum mode = GL_TRIANGLES;
     if (batch.hardware_transform && batch.transform.primitive == 4u &&
@@ -1120,15 +1129,14 @@ bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
         mode = GL_TRIANGLE_STRIP;
 
     if (!batch.indices.empty()) {
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.ebo);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                     static_cast<GLsizeiptr>(
-                         batch.indices.size() * sizeof(std::uint32_t)),
-                     batch.indices.data(), GL_STREAM_DRAW);
+        const std::uintptr_t index_offset =
+            static_cast<std::uintptr_t>(batch.first_index) * sizeof(std::uint32_t);
         glDrawElements(mode, static_cast<GLsizei>(batch.indices.size()),
-                       GL_UNSIGNED_INT, nullptr);
+                       GL_UNSIGNED_INT,
+                       reinterpret_cast<const void *>(index_offset));
     } else {
-        glDrawArrays(mode, 0, static_cast<GLsizei>(batch.vertices.size()));
+        glDrawArrays(mode, static_cast<GLint>(batch.first_vertex),
+                     static_cast<GLsizei>(batch.vertices.size()));
     }
 
     ++s.report.game_draw_calls;
@@ -1340,6 +1348,9 @@ void ge_gpu_backend_record_draw(const GeGpuDrawDescriptor &draw) noexcept {
     GlesState &s = state();
     if (!s.enabled) return;
 
+    if (draw.texture_enabled && draw.texture_content_signature != 0u)
+        s.texture_signature_epochs[texture_key(draw)] = s.frame_epoch;
+
     ++s.report.draw_calls;
     s.report.vertices += draw.vertex_count;
     if (draw.texture_enabled) ++s.report.textured_draw_calls;
@@ -1381,7 +1392,7 @@ bool ge_gpu_backend_texture_needed(
     }
 
     ++s.report.texture_decode_requests;
-    const auto found = s.textures.find(texture_key(draw));
+    const auto found = s.textures.find(texture_lookup_key(draw));
     if (found == s.textures.end()) return true;
 
     found->second.signature_epoch = s.frame_epoch;
@@ -1416,9 +1427,10 @@ bool ge_gpu_backend_texture_signature_needed(
         return false;
     if (s.targets.find(draw.texture_address & 0x001FFFF0u) != s.targets.end())
         return false;
-    const auto found = s.textures.find(texture_key(draw));
-    return found == s.textures.end() ||
-           found->second.signature_epoch != s.frame_epoch;
+    const std::uint64_t base = texture_key(draw);
+    const auto epoch = s.texture_signature_epochs.find(base);
+    return epoch == s.texture_signature_epochs.end() ||
+           epoch->second != s.frame_epoch;
 }
 
 bool ge_gpu_backend_is_framebuffer_feedback_texture(
@@ -1450,7 +1462,7 @@ bool ge_gpu_backend_texture_available(
         s.targets.find(draw.texture_address & 0x001FFFF0u);
     if (target != s.targets.end()) return true;
 
-    const auto found = s.textures.find(texture_key(draw));
+    const auto found = s.textures.find(texture_lookup_key(draw));
     if (found == s.textures.end() || found->second.id == 0u) return false;
     found->second.last_used_epoch = s.frame_epoch;
     return true;
@@ -1504,7 +1516,7 @@ bool ge_gpu_backend_upload_decoded_texture_chain_packed(
         return false;
     }
 
-    const std::uint64_t key = texture_key(draw);
+    const std::uint64_t key = texture_lookup_key(draw);
 
     auto [texture_it, inserted] = s.textures.try_emplace(key);
     GlesTexture &texture = texture_it->second;
@@ -1607,7 +1619,7 @@ bool gles_draw_state_compatible(
 
     if (a.texture_enabled != b.texture_enabled) return false;
     if (a.texture_enabled) {
-        if (texture_key(a) != texture_key(b)) return false;
+        if (texture_lookup_key(a) != texture_lookup_key(b)) return false;
         if (a.texture_function != b.texture_function ||
             a.texture_use_alpha != b.texture_use_alpha ||
             a.texture_double_color != b.texture_double_color ||
@@ -1786,6 +1798,50 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
                          " batches=" + std::to_string(s.batches.size()) +
                          " vblank=" + std::to_string(vblank));
     }
+
+    // Upload all frame geometry once. The old path called glBufferData for
+    // every draw, which is extremely expensive on Mali when a scene contains
+    // hundreds/thousands of PSP draws.
+    s.frame_vertices.clear();
+    s.frame_indices.clear();
+    std::size_t total_vertices = 0u;
+    std::size_t total_indices = 0u;
+    for (const GlesBatch &batch : s.batches) {
+        total_vertices += batch.vertices.size();
+        total_indices += batch.indices.size();
+    }
+    try {
+        s.frame_vertices.reserve(total_vertices);
+        s.frame_indices.reserve(total_indices);
+        for (GlesBatch &batch : s.batches) {
+            batch.first_vertex = static_cast<std::uint32_t>(s.frame_vertices.size());
+            batch.first_index = static_cast<std::uint32_t>(s.frame_indices.size());
+            s.frame_vertices.insert(
+                s.frame_vertices.end(), batch.vertices.begin(), batch.vertices.end());
+
+            if (!batch.indices.empty()) {
+                for (std::uint32_t index : batch.indices)
+                    s.frame_indices.push_back(index + batch.first_vertex);
+            }
+        }
+    } catch (...) {
+        s.report.message = "OpenGL ES frame geometry staging failed";
+        return false;
+    }
+
+    glBindVertexArray(s.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, s.vbo);
+    glBufferData(GL_ARRAY_BUFFER,
+                 static_cast<GLsizeiptr>(
+                     s.frame_vertices.size() * sizeof(GeGpuVertex)),
+                 s.frame_vertices.empty() ? nullptr : s.frame_vertices.data(),
+                 GL_STREAM_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                 static_cast<GLsizeiptr>(
+                     s.frame_indices.size() * sizeof(std::uint32_t)),
+                 s.frame_indices.empty() ? nullptr : s.frame_indices.data(),
+                 GL_STREAM_DRAW);
 
     bool drew = false;
     for (GlesBatch &batch : s.batches) {
