@@ -511,6 +511,287 @@ void audio_output_shutdown() {
 
 }
 
+#elif defined(__ANDROID__)
+
+#include <aaudio/AAudio.h>
+#include <atomic>
+#include <mutex>
+
+namespace lcs {
+namespace {
+
+constexpr std::uint32_t kSampleRate = StreamingLinearResampler::kOutputRate;
+constexpr std::uint32_t kOutputChannels = 2u;
+constexpr std::size_t kGuestChannels = 9u;
+constexpr std::size_t kRingFrames = kSampleRate * 2u;
+constexpr std::uint64_t kLeadFrames = 2048u;
+constexpr std::uint64_t kChannelDiscontinuityFrames = 512u;
+
+struct ChannelStream {
+    StreamingLinearResampler resampler;
+    std::uint64_t cursor{};
+    std::uint32_t source_rate{kSampleRate};
+    bool stereo{true};
+    bool active{};
+};
+
+struct AndroidAudioState {
+    std::mutex mutex;
+    AAudioStream *stream{};
+    std::vector<std::int32_t> ring;
+    std::array<ChannelStream, kGuestChannels> channels{};
+    std::atomic<std::uint64_t> read_frame{0u};
+    std::uint64_t guest_anchor_us{};
+    bool timeline_anchored{};
+    bool opened{};
+    bool failed{};
+    std::uint64_t overrun_frames{};
+    std::uint64_t late_frames{};
+};
+
+AndroidAudioState &audio_state() {
+    static AndroidAudioState state;
+    return state;
+}
+
+bool diagnostics_enabled() {
+    static const bool enabled = std::getenv("PSPRECOMP_AUDIO_DIAG") != nullptr;
+    return enabled;
+}
+
+std::uint64_t guest_frame_for(const AndroidAudioState &state,
+                              std::uint64_t guest_time_us) noexcept {
+    if (!state.timeline_anchored || guest_time_us <= state.guest_anchor_us) return 0u;
+    return ((guest_time_us - state.guest_anchor_us) * kSampleRate + 500000u) / 1000000u;
+}
+
+aaudio_data_callback_result_t audio_data_callback(
+    AAudioStream *, void *user_data, void *audio_data, int32_t num_frames) {
+    auto &state = *static_cast<AndroidAudioState *>(user_data);
+    auto *output = static_cast<std::int16_t *>(audio_data);
+    if (num_frames <= 0 || output == nullptr) return AAUDIO_CALLBACK_RESULT_CONTINUE;
+
+    std::unique_lock<std::mutex> guard(state.mutex, std::try_to_lock);
+    if (!guard.owns_lock() || state.ring.empty()) {
+        std::memset(output, 0,
+                    static_cast<std::size_t>(num_frames) * kOutputChannels *
+                        sizeof(std::int16_t));
+        state.read_frame.fetch_add(static_cast<std::uint64_t>(num_frames),
+                                   std::memory_order_relaxed);
+        return AAUDIO_CALLBACK_RESULT_CONTINUE;
+    }
+
+    std::uint64_t read = state.read_frame.load(std::memory_order_relaxed);
+    for (int32_t frame = 0; frame < num_frames; ++frame, ++read) {
+        const std::size_t slot =
+            static_cast<std::size_t>(read % kRingFrames) * kOutputChannels;
+        output[static_cast<std::size_t>(frame) * 2u] =
+            static_cast<std::int16_t>(std::clamp(state.ring[slot], -32768, 32767));
+        output[static_cast<std::size_t>(frame) * 2u + 1u] =
+            static_cast<std::int16_t>(std::clamp(state.ring[slot + 1u], -32768, 32767));
+        state.ring[slot] = 0;
+        state.ring[slot + 1u] = 0;
+    }
+    state.read_frame.store(read, std::memory_order_relaxed);
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
+}
+
+void audio_error_callback(AAudioStream *, void *user_data, aaudio_result_t error) {
+    auto &state = *static_cast<AndroidAudioState *>(user_data);
+    state.failed = true;
+    if (diagnostics_enabled())
+        std::cerr << "[audio-android] AAudio error=" << AAudio_convertResultToText(error)
+                  << "\n";
+}
+
+bool ensure_device(AndroidAudioState &state) {
+    if (state.opened && state.stream != nullptr) return true;
+    if (state.failed) return false;
+
+    AAudioStreamBuilder *builder = nullptr;
+    aaudio_result_t result = AAudio_createStreamBuilder(&builder);
+    if (result != AAUDIO_OK || builder == nullptr) {
+        state.failed = true;
+        return false;
+    }
+
+    AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
+    AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_I16);
+    AAudioStreamBuilder_setChannelCount(builder, static_cast<int32_t>(kOutputChannels));
+    AAudioStreamBuilder_setSampleRate(builder, static_cast<int32_t>(kSampleRate));
+    AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
+    AAudioStreamBuilder_setDataCallback(builder, audio_data_callback, &state);
+    AAudioStreamBuilder_setErrorCallback(builder, audio_error_callback, &state);
+
+    result = AAudioStreamBuilder_openStream(builder, &state.stream);
+    AAudioStreamBuilder_delete(builder);
+    if (result != AAUDIO_OK || state.stream == nullptr) {
+        if (diagnostics_enabled())
+            std::cerr << "[audio-android] open failed: "
+                      << AAudio_convertResultToText(result) << "\n";
+        state.stream = nullptr;
+        state.failed = true;
+        return false;
+    }
+
+    state.ring.assign(kRingFrames * kOutputChannels, 0);
+    state.read_frame.store(0u, std::memory_order_relaxed);
+    state.timeline_anchored = false;
+    for (ChannelStream &channel : state.channels) channel = ChannelStream{};
+
+    result = AAudioStream_requestStart(state.stream);
+    if (result != AAUDIO_OK) {
+        if (diagnostics_enabled())
+            std::cerr << "[audio-android] start failed: "
+                      << AAudio_convertResultToText(result) << "\n";
+        AAudioStream_close(state.stream);
+        state.stream = nullptr;
+        state.failed = true;
+        state.ring.clear();
+        return false;
+    }
+
+    state.opened = true;
+    if (diagnostics_enabled())
+        std::cerr << "[audio-android] started rate="
+                  << AAudioStream_getSampleRate(state.stream)
+                  << " channels=" << AAudioStream_getChannelCount(state.stream)
+                  << " burst=" << AAudioStream_getFramesPerBurst(state.stream) << "\n";
+    return true;
+}
+
+void reset_channel_locked(AndroidAudioState &state, std::uint32_t channel) {
+    if (channel < state.channels.size()) state.channels[channel] = ChannelStream{};
+}
+
+}  // namespace
+
+bool audio_output_enabled() {
+    static const bool enabled = [] {
+        if (const char *text = std::getenv("PSPRECOMP_AUDIO"))
+            return *text != '\0' && std::strcmp(text, "0") != 0;
+        return true;
+    }();
+    return enabled;
+}
+
+void audio_output_submit(std::span<const std::int16_t> pcm, std::uint32_t frames,
+                         bool stereo, std::uint32_t left, std::uint32_t right,
+                         std::uint32_t source_rate, std::uint32_t channel,
+                         std::uint64_t start_time_us, std::uint64_t now_us) {
+    if (!audio_output_enabled() || frames == 0u || channel >= kGuestChannels) return;
+    if (source_rate == 0u) source_rate = kSampleRate;
+    const std::size_t required =
+        static_cast<std::size_t>(frames) * (stereo ? 2u : 1u);
+    if (pcm.size() < required) return;
+
+    AndroidAudioState &state = audio_state();
+    std::lock_guard<std::mutex> guard(state.mutex);
+    if (!ensure_device(state)) return;
+
+    const std::uint64_t read =
+        state.read_frame.load(std::memory_order_relaxed);
+    if (!state.timeline_anchored) {
+        state.guest_anchor_us = std::min(start_time_us, now_us);
+        state.timeline_anchored = true;
+    }
+
+    ChannelStream &stream = state.channels[channel];
+    const std::uint64_t scheduled = guest_frame_for(state, start_time_us);
+    const std::uint64_t earliest = read + kLeadFrames;
+    const std::uint64_t desired = std::max(scheduled, earliest);
+    const auto distance = [](std::uint64_t a, std::uint64_t b) {
+        return a > b ? a - b : b - a;
+    };
+
+    const bool format_changed = stream.active &&
+        (stream.source_rate != source_rate || stream.stereo != stereo);
+    const bool discontinuity = stream.active &&
+        distance(stream.cursor, desired) > kChannelDiscontinuityFrames;
+
+    if (!stream.active || format_changed || discontinuity) {
+        stream = ChannelStream{};
+        stream.active = true;
+        stream.source_rate = source_rate;
+        stream.stereo = stereo;
+        stream.resampler.reset(source_rate, stereo);
+        stream.cursor = desired;
+    }
+
+    if (stream.cursor < read) {
+        state.late_frames += read - stream.cursor;
+        stream.cursor = earliest;
+        stream.resampler.reset(source_rate, stereo);
+    }
+
+    const std::int64_t left_gain = left;
+    const std::int64_t right_gain = right;
+    const std::uint64_t ring_limit =
+        read + static_cast<std::uint64_t>(kRingFrames) - kLeadFrames;
+
+    stream.resampler.process(
+        pcm, frames, stereo, source_rate,
+        [&](std::int16_t source_left, std::int16_t source_right) {
+            if (stream.cursor >= ring_limit) {
+                ++state.overrun_frames;
+                ++stream.cursor;
+                return;
+            }
+            const std::size_t slot =
+                static_cast<std::size_t>(stream.cursor % kRingFrames) *
+                kOutputChannels;
+            const std::int64_t mixed_left =
+                (static_cast<std::int64_t>(source_left) * left_gain) >> 15;
+            const std::int64_t mixed_right =
+                (static_cast<std::int64_t>(source_right) * right_gain) >> 15;
+            state.ring[slot] += static_cast<std::int32_t>(
+                std::clamp<std::int64_t>(
+                    mixed_left, std::numeric_limits<std::int32_t>::min(),
+                    std::numeric_limits<std::int32_t>::max()));
+            state.ring[slot + 1u] += static_cast<std::int32_t>(
+                std::clamp<std::int64_t>(
+                    mixed_right, std::numeric_limits<std::int32_t>::min(),
+                    std::numeric_limits<std::int32_t>::max()));
+            ++stream.cursor;
+        });
+}
+
+void audio_output_advance(std::uint64_t) {
+    // AAudio consumes the mixed ring continuously from its real-time callback.
+}
+
+void audio_output_reset_channel(std::uint32_t channel) {
+    AndroidAudioState &state = audio_state();
+    std::lock_guard<std::mutex> guard(state.mutex);
+    reset_channel_locked(state, channel);
+}
+
+void audio_output_shutdown() {
+    AndroidAudioState &state = audio_state();
+    AAudioStream *stream = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(state.mutex);
+        stream = state.stream;
+        state.stream = nullptr;
+        state.opened = false;
+    }
+
+    if (stream != nullptr) {
+        (void)AAudioStream_requestStop(stream);
+        (void)AAudioStream_close(stream);
+    }
+
+    std::lock_guard<std::mutex> guard(state.mutex);
+    state.ring.clear();
+    state.timeline_anchored = false;
+    state.read_frame.store(0u, std::memory_order_relaxed);
+    state.failed = false;
+    for (ChannelStream &channel : state.channels) channel = ChannelStream{};
+}
+
+}  // namespace lcs
+
 #else
 
 namespace lcs {
