@@ -668,7 +668,11 @@ public final class MainActivity extends Activity {
 
             @Override
             public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-                nativeSetDisplaySize(width, height);
+                // Capture the physical SurfaceView size only before native
+                // execution starts. ANativeWindow later switches its producer
+                // buffer to the PSP render resolution and may trigger another
+                // surfaceChanged; that must not replace the phone aspect ratio.
+                if (gameThread == null) nativeSetDisplaySize(width, height);
                 nativeSetSurface(holder.getSurface());
                 launchNativeThread(config);
             }
