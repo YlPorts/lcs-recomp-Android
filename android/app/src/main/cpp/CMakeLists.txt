@@ -38,9 +38,9 @@ target_include_directories(lcs_generated PRIVATE
     "${REPO_ROOT}/include"
     "${REPO_ROOT}/lcs/host"
 )
-# Iteration builds use O1 without debug info: the generated AOT source is ~96 MB.
-# Once the Android port is stable, release builds can switch this back to O2.
-target_compile_options(lcs_generated PRIVATE -O1 -g0 -fexceptions -frtti)
+# Runtime build: optimize the generated AOT code now that the Android bring-up
+# is stable. ccache keeps rebuild iteration practical.
+target_compile_options(lcs_generated PRIVATE -O2 -g0 -fexceptions -frtti)
 target_compile_definitions(lcs_generated PRIVATE
     PSPRECOMP_AOT_ASSUME_NO_WRITE_WATCH=1
     PSPRECOMP_AOT_PRODUCTION_FASTPATHS=1
@@ -90,6 +90,16 @@ find_library(ANDROID_LIB android)
 find_library(LOG_LIB log)
 find_library(EGL_LIB EGL)
 find_library(GLES_LIB GLESv3)
+find_library(AAUDIO_LIB aaudio)
+
+# The software GE dominates frame time on mobile. Allow ARM/Clang to contract
+# floating-point operations and optimize the rasterizer aggressively while
+# leaving the guest AOT/runtime on conservative math semantics.
+set_source_files_properties(
+    "${REPO_ROOT}/lcs/host/ge_renderer.cpp"
+    "${REPO_ROOT}/lcs/host/lcs_ge_exec.cpp"
+    PROPERTIES COMPILE_OPTIONS "-O3;-ffp-contract=fast"
+)
 
 target_link_libraries(lcsrecomp PRIVATE
     lcs_generated
@@ -98,4 +108,5 @@ target_link_libraries(lcsrecomp PRIVATE
     ${LOG_LIB}
     ${EGL_LIB}
     ${GLES_LIB}
+    ${AAUDIO_LIB}
 )
