@@ -252,6 +252,7 @@ void destroy_gl_objects(GlesState &s) noexcept {
 }
 
 bool create_gl_objects(GlesState &s, std::string &error) {
+    runtime_log_line("gles: create_gl_objects begin");
     static constexpr char kVertexShader[] = R"GLSL(#version 300 es
 precision highp float;
 precision highp int;
@@ -497,6 +498,7 @@ void main() {
 
     glBindVertexArray(0);
     s.gl_ready = true;
+    runtime_log_line("gles: create_gl_objects complete");
     return true;
 }
 
@@ -514,6 +516,7 @@ bool ensure_context(GlesState &s, std::string &error) {
     }
 
     if (s.display == EGL_NO_DISPLAY) {
+        runtime_log_line("gles: egl initialize begin");
         s.display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
         if (s.display == EGL_NO_DISPLAY || !eglInitialize(s.display, nullptr, nullptr)) {
             error = egl_error("eglInitialize");
@@ -550,6 +553,7 @@ bool ensure_context(GlesState &s, std::string &error) {
             error = egl_error("eglCreateContext");
             return false;
         }
+        runtime_log_line("gles: EGL context created");
     }
 
     if (s.surface_dirty || s.surface == EGL_NO_SURFACE) {
@@ -571,12 +575,14 @@ bool ensure_context(GlesState &s, std::string &error) {
             return false;
         }
 
+        runtime_log_line("gles: creating window surface");
         s.surface = eglCreateWindowSurface(s.display, s.config, window, nullptr);
         ANativeWindow_release(window);
         if (s.surface == EGL_NO_SURFACE) {
             error = egl_error("eglCreateWindowSurface");
             return false;
         }
+        runtime_log_line("gles: window surface created");
     }
 
     if (!eglMakeCurrent(s.display, s.surface, s.surface, s.context)) {
@@ -585,6 +591,7 @@ bool ensure_context(GlesState &s, std::string &error) {
     }
 
     if (!s.gl_ready) {
+        runtime_log_line("gles: makeCurrent OK, creating GL objects");
         if (!create_gl_objects(s, error)) return false;
         s.gl_thread = current_thread;
         (void)eglSwapInterval(s.display, 0);
@@ -632,6 +639,12 @@ bool ensure_target(GlesState &s, GlesTarget &target, std::string &error) {
     target.render_width = render_width;
     target.render_height = render_height;
 
+    if (s.frame_epoch <= 12u) {
+        runtime_log_line("gles: create target " +
+                         std::to_string(render_width) + "x" +
+                         std::to_string(render_height) +
+                         " address=" + std::to_string(target.address));
+    }
     glGenTextures(1, &target.color);
     glBindTexture(GL_TEXTURE_2D, target.color);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -910,6 +923,12 @@ void configure_texture_sampling(const GeGpuDrawDescriptor &draw, GLuint texture)
 
 bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
     GlesTarget &target = target_metadata(s, batch.draw.framebuffer_address);
+    if (s.frame_epoch <= 12u) {
+        runtime_log_line("gles: draw frame=" + std::to_string(s.frame_epoch) +
+                         " fb=" + std::to_string(target.address) +
+                         " verts=" + std::to_string(batch.vertices.size()) +
+                         " idx=" + std::to_string(batch.indices.size()));
+    }
     if (!ensure_target(s, target, error)) return false;
 
     glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
@@ -1300,6 +1319,13 @@ bool ge_gpu_backend_upload_decoded_texture_chain_packed(
     if (!s.enabled || base_width == 0u || base_height == 0u ||
         mip_levels == 0u || rgba8.empty())
         return false;
+    if (base_width > 2048u || base_height > 2048u || mip_levels > 8u) {
+        ++s.report.rejected_texture_decodes;
+        runtime_log_line("gles: rejected oversized texture " +
+                         std::to_string(base_width) + "x" +
+                         std::to_string(base_height));
+        return false;
+    }
 
     std::string error;
     if (!ensure_context(s, error)) {
@@ -1308,6 +1334,24 @@ bool ge_gpu_backend_upload_decoded_texture_chain_packed(
     }
 
     const std::uint64_t key = texture_key(draw);
+
+    // Keep the mobile GPU cache bounded. Loading a new area can upload hundreds
+    // of PSP textures in a burst; an unbounded map can push the driver into OOM
+    // on mid-range phones and terminate the process without a C++ exception.
+    if (s.textures.find(key) == s.textures.end() && s.textures.size() >= 256u) {
+        auto victim = s.textures.end();
+        for (auto it = s.textures.begin(); it != s.textures.end(); ++it) {
+            if (victim == s.textures.end() ||
+                it->second.last_used_epoch < victim->second.last_used_epoch)
+                victim = it;
+        }
+        if (victim != s.textures.end()) {
+            if (victim->second.id != 0u) glDeleteTextures(1, &victim->second.id);
+            s.textures.erase(victim);
+            ++s.report.evicted_textures;
+        }
+    }
+
     GlesTexture &texture = s.textures[key];
     if (texture.id == 0u) {
         glGenTextures(1, &texture.id);
@@ -1457,6 +1501,12 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
         return false;
     }
 
+    if (s.frame_epoch <= 12u) {
+        runtime_log_line("gles: finish frame=" + std::to_string(s.frame_epoch) +
+                         " batches=" + std::to_string(s.batches.size()) +
+                         " vblank=" + std::to_string(vblank));
+    }
+
     bool drew = false;
     for (GlesBatch &batch : s.batches) {
         if (batch.vertices.empty()) continue;
@@ -1471,6 +1521,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     bool presented = false;
     auto found = s.targets.find(s.display_framebuffer);
     if (drew && found != s.targets.end() && found->second.color != 0u) {
+        if (s.frame_epoch <= 12u) runtime_log_line("gles: presenting frame");
         presented = present_target(s, found->second, error);
         if (!presented && !error.empty())
             runtime_log_error("gles present", error);
@@ -1484,6 +1535,13 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
         found != s.targets.end() ? found->second.render_height : 0u;
     s.report.release_candidate_ready = presented;
     s.report.swapchain_active = s.surface != EGL_NO_SURFACE;
+    if (s.frame_epoch <= 12u) {
+        runtime_log_line(std::string("gles: frame result presented=") +
+                         (presented ? "1" : "0") +
+                         " targets=" + std::to_string(s.targets.size()) +
+                         " textures=" + std::to_string(s.textures.size()));
+    }
+
     s.report.message = presented
         ? "OpenGL ES 3 native GE active"
         : (!error.empty() ? error : "OpenGL ES GE frame not ready");
