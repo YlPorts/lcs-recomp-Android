@@ -89,10 +89,10 @@ Java_com_ylports_lcsrecomp_MainActivity_nativeRun(
     // framebuffer memory; synchronous execution avoids racing guest writes.
     setenv("LCS_GE_ASYNC", "0", 1);
 
-    // On Android prefer the framebuffer explicitly selected through
-    // sceDisplaySetFrameBuf.  The desktop path may prefer the most recent GE
-    // render target, which can be a non-displayed intermediate target.
-    setenv("LCS_NO_PRESENT_RENDER_TARGET", "1", 1);
+    // Let the renderer choose the actual GE render target. The framebuffer
+    // selected through sceDisplaySetFrameBuf can remain black while the game is
+    // still rendering into another VRAM target before the flip.
+    unsetenv("LCS_NO_PRESENT_RENDER_TARGET");
 
     std::string executable = game_root + "/LCSNative";
     char *argv[] = {
