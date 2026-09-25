@@ -103,6 +103,8 @@ struct GlesState {
     GLint u_vertex_color_affine{-1};
 
     GLint u_tex{-1};
+    GLint u_texture_inv_size{-1};
+    GLint u_texture_coords_texel{-1};
     GLint u_texture_enabled{-1};
     GLint u_texture_function{-1};
     GLint u_texture_use_alpha{-1};
@@ -319,6 +321,8 @@ precision highp float;
 precision highp int;
 
 uniform sampler2D uTexture;
+uniform vec2 uTextureInvSize;
+uniform int uTextureCoordsTexel;
 uniform int uTextureEnabled;
 uniform int uTextureFunction;
 uniform int uTextureUseAlpha;
@@ -360,8 +364,12 @@ void main() {
     if (uTextureEnabled != 0) {
         float q = abs(vQ) < 1.0e-20 ? 1.0 : vQ;
         vec2 sampleUv = vUv / q;
-        // PSP/D3D texture space has its origin at the top-left; OpenGL ES
-        // samples from the bottom-left, so flip V at the sampling boundary.
+        // CPU-transformed PSP vertices carry UV in texel units. GLES texture()
+        // expects normalized coordinates, so convert using the bound texture's
+        // logical dimensions. Hardware-transform vertices keep normalized UV.
+        if (uTextureCoordsTexel != 0)
+            sampleUv *= uTextureInvSize;
+        // PSP texture origin is top-left; GL's normalized V origin is bottom-left.
         sampleUv.y = 1.0 - sampleUv.y;
         vec4 texel = texture(uTexture, sampleUv);
         int fn = uTextureFunction & 7;
@@ -483,6 +491,8 @@ void main() {
     s.u_vertex_color_affine = glGetUniformLocation(s.program, "uVertexColorAffine");
 
     s.u_tex = glGetUniformLocation(s.program, "uTexture");
+    s.u_texture_inv_size = glGetUniformLocation(s.program, "uTextureInvSize");
+    s.u_texture_coords_texel = glGetUniformLocation(s.program, "uTextureCoordsTexel");
     s.u_texture_enabled = glGetUniformLocation(s.program, "uTextureEnabled");
     s.u_texture_function = glGetUniformLocation(s.program, "uTextureFunction");
     s.u_texture_use_alpha = glGetUniformLocation(s.program, "uTextureUseAlpha");
@@ -587,7 +597,12 @@ bool ensure_context(GlesState &s, std::string &error) {
         runtime_log_line("gles: window surface created");
     }
 
-    if (!eglMakeCurrent(s.display, s.surface, s.surface, s.context)) {
+    const bool already_current =
+        eglGetCurrentContext() == s.context &&
+        eglGetCurrentSurface(EGL_DRAW) == s.surface &&
+        eglGetCurrentSurface(EGL_READ) == s.surface;
+    if (!already_current &&
+        !eglMakeCurrent(s.display, s.surface, s.surface, s.context)) {
         error = egl_error("eglMakeCurrent");
         return false;
     }
@@ -836,9 +851,38 @@ void set_transform_uniforms(
     glUniform1i(s.u_vertex_color_affine, hw.vertex_color_affine ? 1 : 0);
 }
 
+std::pair<std::uint32_t, std::uint32_t> texture_logical_size(
+    GlesState &s, const GeGpuDrawDescriptor &draw) noexcept {
+    if (!draw.texture_enabled) return {1u, 1u};
+
+    const std::uint32_t address = draw.texture_address & 0x001FFFF0u;
+    const auto framebuffer = s.targets.find(address);
+    if (framebuffer != s.targets.end()) {
+        return {
+            std::max<std::uint32_t>(1u, framebuffer->second.logical_width),
+            std::max<std::uint32_t>(1u, framebuffer->second.logical_height)};
+    }
+
+    const auto found = s.textures.find(texture_key(draw));
+    if (found != s.textures.end()) {
+        return {
+            std::max<std::uint32_t>(1u, found->second.width),
+            std::max<std::uint32_t>(1u, found->second.height)};
+    }
+
+    return {
+        std::max<std::uint32_t>(1u, draw.texture_width),
+        std::max<std::uint32_t>(1u, draw.texture_height)};
+}
+
 void set_pixel_uniforms(GlesState &s, const GeGpuDrawDescriptor &draw,
-                        bool textured) {
+                        bool textured, bool texel_coordinates) {
     glUniform1i(s.u_tex, 0);
+    const auto [texture_width, texture_height] = texture_logical_size(s, draw);
+    glUniform2f(s.u_texture_inv_size,
+                1.0f / static_cast<float>(texture_width),
+                1.0f / static_cast<float>(texture_height));
+    glUniform1i(s.u_texture_coords_texel, texel_coordinates ? 1 : 0);
     glUniform1i(s.u_texture_enabled, textured ? 1 : 0);
     glUniform1i(s.u_texture_function, static_cast<GLint>(draw.texture_function & 7u));
     glUniform1i(s.u_texture_use_alpha, draw.texture_use_alpha ? 1 : 0);
@@ -988,7 +1032,7 @@ bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
     const bool textured = batch.draw.texture_enabled && texture != 0u;
     if (textured) configure_texture_sampling(batch.draw, texture);
     else glBindTexture(GL_TEXTURE_2D, 0u);
-    set_pixel_uniforms(s, batch.draw, textured);
+    set_pixel_uniforms(s, batch.draw, textured, !batch.hardware_transform);
 
     glBindVertexArray(s.vao);
     glBindBuffer(GL_ARRAY_BUFFER, s.vbo);
@@ -1537,11 +1581,16 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
         found != s.targets.end() ? found->second.render_height : 0u;
     s.report.release_candidate_ready = presented;
     s.report.swapchain_active = s.surface != EGL_NO_SURFACE;
-    if (s.frame_epoch <= 12u) {
-        runtime_log_line(std::string("gles: frame result presented=") +
-                         (presented ? "1" : "0") +
+    if (s.frame_epoch <= 12u || (s.frame_epoch % 120u) == 0u) {
+        runtime_log_line(std::string("gles: frame result epoch=") +
+                         std::to_string(s.frame_epoch) +
+                         " presented=" + (presented ? "1" : "0") +
                          " targets=" + std::to_string(s.targets.size()) +
-                         " textures=" + std::to_string(s.textures.size()));
+                         " textures=" + std::to_string(s.textures.size()) +
+                         " draws=" + std::to_string(s.report.game_draw_calls) +
+                         " texUploads=" + std::to_string(s.report.decoded_texture_uploads) +
+                         " texMB=" + std::to_string(
+                             s.report.decoded_texture_bytes / (1024u * 1024u)));
     }
 
     s.report.message = presented
