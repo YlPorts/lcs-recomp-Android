@@ -14,6 +14,7 @@
 #include <atomic>
 #include <array>
 #include <cmath>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -72,6 +73,8 @@ struct GlesState {
     std::thread::id gl_thread{};
     std::uint32_t scale{2u};
     std::uint64_t frame_epoch{1u};
+    std::uint64_t perf_frame_ns{};
+    std::uint64_t perf_frame_count{};
 
     std::mutex window_mutex;
     ANativeWindow *window{};
@@ -1539,6 +1542,7 @@ void ge_gpu_backend_display_logical_size(
 bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     GlesState &s = state();
     if (!s.enabled) return false;
+    const auto perf_started = std::chrono::steady_clock::now();
 
     std::string error;
     if (!ensure_context(s, error)) {
@@ -1581,16 +1585,31 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
         found != s.targets.end() ? found->second.render_height : 0u;
     s.report.release_candidate_ready = presented;
     s.report.swapchain_active = s.surface != EGL_NO_SURFACE;
+    const std::uint64_t frame_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - perf_started).count());
+    s.perf_frame_ns += frame_ns;
+    ++s.perf_frame_count;
+
     if (s.frame_epoch <= 12u || (s.frame_epoch % 120u) == 0u) {
+        const double average_ms = s.perf_frame_count != 0u
+            ? static_cast<double>(s.perf_frame_ns) /
+                static_cast<double>(s.perf_frame_count) / 1.0e6
+            : 0.0;
         runtime_log_line(std::string("gles: frame result epoch=") +
                          std::to_string(s.frame_epoch) +
                          " presented=" + (presented ? "1" : "0") +
+                         " avgGlesMs=" + std::to_string(average_ms) +
                          " targets=" + std::to_string(s.targets.size()) +
                          " textures=" + std::to_string(s.textures.size()) +
                          " draws=" + std::to_string(s.report.game_draw_calls) +
                          " texUploads=" + std::to_string(s.report.decoded_texture_uploads) +
                          " texMB=" + std::to_string(
                              s.report.decoded_texture_bytes / (1024u * 1024u)));
+        if ((s.frame_epoch % 120u) == 0u) {
+            s.perf_frame_ns = 0u;
+            s.perf_frame_count = 0u;
+        }
     }
 
     s.report.message = presented
