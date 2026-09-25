@@ -9,6 +9,14 @@ on:
       - "src/**"
       - "include/**"
       - ".github/workflows/android.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "android/**"
+      - "lcs/**"
+      - "src/**"
+      - "include/**"
+      - ".github/workflows/android.yml"
   workflow_dispatch:
 
 permissions:
