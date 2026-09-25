@@ -36,6 +36,13 @@
 #define PSPRECOMP_GE_X86_SIMD 0
 #endif
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#define PSPRECOMP_GE_ARM_NEON 1
+#else
+#define PSPRECOMP_GE_ARM_NEON 0
+#endif
+
 namespace lcs {
 
 namespace {
@@ -76,6 +83,11 @@ inline void divide2_same_denominator(float n0, float n1, float denominator,
     _mm_store_ps(values, result);
     out0 = values[0];
     out1 = values[1];
+#elif PSPRECOMP_GE_ARM_NEON
+    const float32x4_t values{n0, n1, 0.0f, 0.0f};
+    const float32x4_t result = vdivq_f32(values, vdupq_n_f32(denominator));
+    out0 = vgetq_lane_f32(result, 0);
+    out1 = vgetq_lane_f32(result, 1);
 #else
     out0 = n0 / denominator;
     out1 = n1 / denominator;
@@ -91,6 +103,12 @@ inline void divide3_same_denominator(float n0, float n1, float n2, float denomin
     out0 = values[0];
     out1 = values[1];
     out2 = values[2];
+#elif PSPRECOMP_GE_ARM_NEON
+    const float32x4_t values{n0, n1, n2, 0.0f};
+    const float32x4_t result = vdivq_f32(values, vdupq_n_f32(denominator));
+    out0 = vgetq_lane_f32(result, 0);
+    out1 = vgetq_lane_f32(result, 1);
+    out2 = vgetq_lane_f32(result, 2);
 #else
     out0 = n0 / denominator;
     out1 = n1 / denominator;
@@ -105,6 +123,10 @@ inline void divide4_same_denominator(float n0, float n1, float n2, float n3,
     const __m128 result = _mm_div_ps(_mm_load_ps(values), _mm_set1_ps(denominator));
     _mm_store_ps(values, result);
     out[0] = values[0]; out[1] = values[1]; out[2] = values[2]; out[3] = values[3];
+#elif PSPRECOMP_GE_ARM_NEON
+    const float32x4_t values{n0, n1, n2, n3};
+    const float32x4_t result = vdivq_f32(values, vdupq_n_f32(denominator));
+    vst1q_f32(out, result);
 #else
     out[0] = n0 / denominator; out[1] = n1 / denominator;
     out[2] = n2 / denominator; out[3] = n3 / denominator;
@@ -2989,6 +3011,11 @@ struct PreparedScreenTriangle {
     __m128 edge_ay{};
     __m128 edge_dx{};
     __m128 edge_dy{};
+#elif PSPRECOMP_GE_ARM_NEON
+    float32x4_t edge_ax{};
+    float32x4_t edge_ay{};
+    float32x4_t edge_dx{};
+    float32x4_t edge_dy{};
 #endif
 };
 
@@ -3215,6 +3242,11 @@ bool prepare_screen_triangle(const std::array<std::uint32_t, 256> &commands,
     prepared.edge_ay = _mm_set_ps(0.0f, a.y, c.y, b.y);
     prepared.edge_dx = _mm_set_ps(0.0f, b.x - a.x, a.x - c.x, c.x - b.x);
     prepared.edge_dy = _mm_set_ps(0.0f, b.y - a.y, a.y - c.y, c.y - b.y);
+#elif PSPRECOMP_GE_ARM_NEON
+    prepared.edge_ax = float32x4_t{b.x, c.x, a.x, 0.0f};
+    prepared.edge_ay = float32x4_t{b.y, c.y, a.y, 0.0f};
+    prepared.edge_dx = float32x4_t{c.x - b.x, a.x - c.x, b.x - a.x, 0.0f};
+    prepared.edge_dy = float32x4_t{c.y - b.y, a.y - c.y, b.y - a.y, 0.0f};
 #endif
     return true;
 }
@@ -3299,12 +3331,19 @@ void rasterize_prepared_triangle_rows(psprecomp::GuestMemory &memory,
     const __m128 area_vector = _mm_set1_ps(triangle.area);
     const __m128 zero_vector = _mm_setzero_ps();
     const bool positive_area = triangle.area > 0.0f;
+#elif PSPRECOMP_GE_ARM_NEON
+    const float32x4_t area_vector = vdupq_n_f32(triangle.area);
+    const float32x4_t zero_vector = vdupq_n_f32(0.0f);
+    const bool positive_area = triangle.area > 0.0f;
 #endif
     for (std::int32_t y = row_first; y <= row_last; ++y) {
         const float py = static_cast<float>(y) + 0.5f;
 #if PSPRECOMP_GE_X86_SIMD
         const __m128 edge_y_term = _mm_mul_ps(
             _mm_sub_ps(_mm_set1_ps(py), triangle.edge_ay), triangle.edge_dx);
+#elif PSPRECOMP_GE_ARM_NEON
+        const float32x4_t edge_y_term = vmulq_f32(
+            vsubq_f32(vdupq_n_f32(py), triangle.edge_ay), triangle.edge_dx);
 #endif
         for (std::int32_t x = triangle.min_x; x <= triangle.max_x; ++x) {
             const float px = static_cast<float>(x) + 0.5f;
@@ -3322,6 +3361,20 @@ void rasterize_prepared_triangle_rows(psprecomp::GuestMemory &memory,
             l0 = barycentric[0];
             l1 = barycentric[1];
             l2 = barycentric[2];
+#elif PSPRECOMP_GE_ARM_NEON
+            const float32x4_t edges = vsubq_f32(
+                vmulq_f32(vsubq_f32(vdupq_n_f32(px), triangle.edge_ax), triangle.edge_dy),
+                edge_y_term);
+            const uint32x4_t outside = positive_area
+                ? vcltq_f32(edges, zero_vector)
+                : vcgtq_f32(edges, zero_vector);
+            if ((vgetq_lane_u32(outside, 0) |
+                 vgetq_lane_u32(outside, 1) |
+                 vgetq_lane_u32(outside, 2)) != 0u) continue;
+            const float32x4_t barycentric = vdivq_f32(edges, area_vector);
+            l0 = vgetq_lane_f32(barycentric, 0);
+            l1 = vgetq_lane_f32(barycentric, 1);
+            l2 = vgetq_lane_f32(barycentric, 2);
 #else
             const float e0 = edge_function(b, c, px, py);
             const float e1 = edge_function(c, a, px, py);
