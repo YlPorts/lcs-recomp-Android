@@ -7,10 +7,62 @@
 
 #include <cstdlib>
 #include <string>
+#include <csignal>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cstring>
 
 int lcs_android_entry(int argc, char **argv);
 
 namespace {
+
+char g_crash_marker_path[768]{};
+
+void native_crash_handler(int signal_number) {
+    const char *message = "native signal\n";
+    switch (signal_number) {
+    case SIGSEGV: message = "SIGSEGV\n"; break;
+    case SIGABRT: message = "SIGABRT\n"; break;
+    case SIGBUS:  message = "SIGBUS\n";  break;
+    case SIGILL:  message = "SIGILL\n";  break;
+    case SIGFPE:  message = "SIGFPE\n";  break;
+    default: break;
+    }
+
+    if (g_crash_marker_path[0] != '\0') {
+        const int fd = open(g_crash_marker_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+        if (fd >= 0) {
+            (void)write(fd, message, std::strlen(message));
+            (void)close(fd);
+        }
+    }
+
+    std::signal(signal_number, SIG_DFL);
+    std::raise(signal_number);
+}
+
+void install_native_crash_handlers(const std::string &config_path) {
+    std::string marker = config_path;
+    const std::size_t slash = marker.find_last_of('/');
+    if (slash != std::string::npos) marker.resize(slash + 1u);
+    else marker.clear();
+    marker += "native_crash.txt";
+
+    std::memset(g_crash_marker_path, 0, sizeof(g_crash_marker_path));
+    const std::size_t count = std::min(marker.size(), sizeof(g_crash_marker_path) - 1u);
+    std::memcpy(g_crash_marker_path, marker.data(), count);
+    if (g_crash_marker_path[0] != '\0') (void)unlink(g_crash_marker_path);
+
+    struct sigaction action {};
+    action.sa_handler = native_crash_handler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESETHAND;
+    (void)sigaction(SIGSEGV, &action, nullptr);
+    (void)sigaction(SIGABRT, &action, nullptr);
+    (void)sigaction(SIGBUS,  &action, nullptr);
+    (void)sigaction(SIGILL,  &action, nullptr);
+    (void)sigaction(SIGFPE,  &action, nullptr);
+}
 
 std::string from_jstring(JNIEnv *env, jstring text) {
     if (text == nullptr) return {};
@@ -75,6 +127,8 @@ Java_com_ylports_lcsrecomp_MainActivity_nativeRun(
     const std::string game_root = from_jstring(env, game_root_text);
     const std::string config_path = from_jstring(env, config_path_text);
     if (game_root.empty()) return 2;
+
+    install_native_crash_handlers(config_path);
 
     lcs::android_debug::reset();
     lcs::android_debug::set_stage(lcs::android_debug::Stage::NativeEntry);
