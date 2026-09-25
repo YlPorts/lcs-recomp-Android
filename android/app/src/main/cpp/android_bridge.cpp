@@ -31,6 +31,15 @@ Java_com_ylports_lcsrecomp_MainActivity_nativeSetSurface(
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_com_ylports_lcsrecomp_MainActivity_nativeSetDisplaySize(
+    JNIEnv *, jclass, jint width, jint height) {
+    if (width > 0 && height > 0)
+        lcs::android_host::set_display_size(
+            static_cast<std::uint32_t>(width),
+            static_cast<std::uint32_t>(height));
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_com_ylports_lcsrecomp_MainActivity_nativeSetInput(
     JNIEnv *, jclass, jint buttons, jint analog_x, jint analog_y,
     jint camera_x, jint camera_y, jboolean accelerate, jboolean brake) {
@@ -77,17 +86,26 @@ Java_com_ylports_lcsrecomp_MainActivity_nativeRun(
     setenv("PSPRECOMP_GE_BACKEND", "software", 1);
     setenv("PSPRECOMP_INTERNAL_WIDTH", "480", 1);
     setenv("PSPRECOMP_INTERNAL_HEIGHT", "272", 1);
-    setenv("PSPRECOMP_AUDIO", "0", 1);
+    setenv("PSPRECOMP_AUDIO", "1", 1);
 
     // FFmpeg/PMF decoding is not linked in the Android bootstrap yet. Tell the
     // HLE to reject MPEG creation immediately so startup movies are skipped
     // instead of repeatedly waiting on a decoder that can never produce a frame.
     setenv("LCS_SKIP_MPEG", "1", 1);
 
-    // Keep rendering deterministic on mobile while the native Android backend
-    // is being validated.  The software GE and presentation both touch PSP
-    // framebuffer memory; synchronous execution avoids racing guest writes.
-    setenv("LCS_GE_ASYNC", "0", 1);
+    // The native-window presentation path is stable now, so let the GE worker
+    // overlap software rendering with guest CPU execution again.
+    setenv("LCS_GE_ASYNC", "1", 1);
+
+    // Mobile software-raster tuning for the 2+6 core layout common on midrange
+    // ARM phones. Six row workers plus the GE/game threads keeps all cores busy
+    // without creating excessive little-core contention.
+    setenv("PSPRECOMP_RASTER_THREADS", "6", 1);
+    setenv("PSPRECOMP_RASTER_PARALLEL_PIXELS", "512", 1);
+    setenv("PSPRECOMP_GE_PARALLEL_VERTEX_DECODE", "1", 1);
+    setenv("PSPRECOMP_GE_PARALLEL_VERTEX_THRESHOLD", "96", 1);
+    setenv("PSPRECOMP_GE_PARALLEL_VERTEX_MAX_WORKERS", "6", 1);
+    setenv("PSPRECOMP_GE_PARALLEL_TEXTURE_DECODE", "1", 1);
 
     // Let the renderer choose the actual GE render target. The framebuffer
     // selected through sceDisplaySetFrameBuf can remain black while the game is
