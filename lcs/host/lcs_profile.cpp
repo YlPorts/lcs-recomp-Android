@@ -9,6 +9,10 @@
 #include "lcs_audio_output.hpp"
 #include "lcs_fps_overlay.hpp"
 
+#if defined(__ANDROID__)
+#include "android_debug.hpp"
+#endif
+
 #include "psprecomp/common.hpp"
 
 #include <algorithm>
@@ -3877,6 +3881,9 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             display_state.buffer_width = stride;
             display_state.pixel_format = format;
             display_state.sync_mode = sync;
+#if defined(__ANDROID__)
+            android_debug::note_set_framebuffer(address, stride, format);
+#endif
             set_success(ctx);
         });
     runtime.register_hle("sceDisplay", 0x4D4E10ECu,
@@ -3896,6 +3903,9 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         });
     auto wait_vblank = [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
         ++display_vblank_index;
+#if defined(__ANDROID__)
+        android_debug::note_vblank(display_vblank_index, display_state.frame_buffer);
+#endif
         check_wall_clock_limit(rt, 0x3Fu);
         reset_pc_profile_on_key();
         dump_ram_if_requested(rt.memory());
@@ -3971,6 +3981,9 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             if (std::getenv("LCS_TICK_DIAG") != nullptr)
                 std::cerr << "[tick] sceGeListEnQueue list=0x" << psprecomp::hex32(ctx.gpr[4]) << "\n";
             const std::uint32_t list_address = ctx.gpr[4];
+#if defined(__ANDROID__)
+            android_debug::note_ge_list(list_address);
+#endif
             static const bool draw_vblank_lists = std::getenv("LCS_DRAW_VBLANK_LISTS") != nullptr;
             const bool from_vblank = !draw_vblank_lists && in_vblank_interrupt();
             if (!from_vblank) cap_frame_rate(list_address);
