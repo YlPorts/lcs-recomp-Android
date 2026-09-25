@@ -57,6 +57,7 @@ add_library(lcs_main_obj OBJECT "${REPO_ROOT}/lcs/host/main.cpp")
 target_include_directories(lcs_main_obj PRIVATE
     "${REPO_ROOT}/include"
     "${REPO_ROOT}/lcs/host"
+    "${CMAKE_CURRENT_LIST_DIR}"
 )
 target_compile_definitions(lcs_main_obj PRIVATE
     main=lcs_android_entry
@@ -68,6 +69,7 @@ target_compile_options(lcs_main_obj PRIVATE -O2 -fexceptions -frtti)
 add_library(lcsrecomp SHARED
     ${LCS_HOST}
     "${CMAKE_CURRENT_LIST_DIR}/android_bridge.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/android_debug.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/display_window_android.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/lcs_media_decoder_stub.cpp"
     $<TARGET_OBJECTS:lcs_main_obj>
