@@ -45,6 +45,7 @@ public final class MainActivity extends Activity {
 
     static native int nativeRun(String gameRoot, String configPath);
     static native void nativeSetSurface(android.view.Surface surface);
+    static native void nativeSetDisplaySize(int width, int height);
     static native void nativeSetInput(int buttons, int analogX, int analogY,
                                       int cameraX, int cameraY,
                                       boolean accelerate, boolean brake);
@@ -587,23 +588,26 @@ public final class MainActivity extends Activity {
 
     private File ensureConfig() throws IOException {
         File config = new File(getFilesDir(), "LCSNative.ini");
-        if (config.isFile()) return config;
 
+        // Rewrite the bootstrap config when launching so users upgrading from
+        // the diagnostic builds do not remain stuck with audio disabled or
+        // letterboxed presentation settings.
         String text =
                 "[Display]\n"
                 + "Enabled=true\n"
                 + "ResolutionMode=PSP\n"
-                + "AspectRatio=Preserve\n"
+                + "AspectRatio=Stretch\n"
                 + "UpscaleFilter=Bilinear\n"
                 + "IntegerScale=false\n"
-                + "ShowFPS=true\n\n"
+                + "ShowFPS=false\n\n"
                 + "[Rendering]\n"
                 + "InternalResolutionMode=PSP\n"
                 + "InternalScale=1\n"
                 + "MSAA=1\n"
                 + "HardwareTransform=false\n\n"
                 + "[Audio]\n"
-                + "Enabled=false\n\n"
+                + "Enabled=true\n"
+                + "Volume=100\n\n"
                 + "[Timing]\n"
                 + "FrameRate=30\n\n"
                 + "[Controls]\n"
@@ -649,36 +653,24 @@ public final class MainActivity extends Activity {
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
 
-        debugView = new TextView(this);
-        debugView.setText("LCS Android 0.3 DIAG\nstarting...");
-        debugView.setTextColor(Color.WHITE);
-        debugView.setTextSize(10f);
-        debugView.setPadding(12, 8, 12, 8);
-        debugView.setBackgroundColor(Color.argb(155, 0, 0, 0));
-        debugView.setGravity(Gravity.START);
-        FrameLayout.LayoutParams debugParams = new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP | Gravity.START);
-        debugParams.leftMargin = 16;
-        debugParams.topMargin = 16;
-        root.addView(debugView, debugParams);
-
-        setContentView(root);
+        // Runtime diagnostics remain available natively, but the normal mobile
+        // build no longer draws the large diagnostic overlay over gameplay.
+        debugView = null;
         debugHandler.removeCallbacks(debugPoll);
-        debugHandler.post(debugPoll);
+        setContentView(root);
 
         SurfaceHolder holder = surfaceView.getHolder();
         holder.addCallback(new SurfaceHolder.Callback() {
             @Override
             public void surfaceCreated(SurfaceHolder holder) {
                 nativeSetSurface(holder.getSurface());
-                launchNativeThread(config);
             }
 
             @Override
             public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+                nativeSetDisplaySize(width, height);
                 nativeSetSurface(holder.getSurface());
+                launchNativeThread(config);
             }
 
             @Override
