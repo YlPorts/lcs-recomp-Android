@@ -568,6 +568,23 @@ public final class MainActivity extends Activity {
         file.delete();
     }
 
+    private void validateInstalledGameRevision() throws IOException {
+        File pspGame = findCaseInsensitiveDirectory(gameDirectory(), "PSP_GAME");
+        if (pspGame == null) throw new IOException("Falta PSP_GAME.");
+        File param = findRelativeCaseInsensitive(pspGame, "PARAM.SFO");
+        if (param == null) throw new IOException("Falta PSP_GAME/PARAM.SFO.");
+
+        String discId = readSfoString(param, "DISC_ID");
+        String discVersion = readSfoString(param, "DISC_VERSION");
+        String normalizedId = discId != null ? discId.replace("-", "") : "";
+        if (!"ULUS10041".equalsIgnoreCase(normalizedId))
+            throw new IOException("DISC_ID=" + String.valueOf(discId)
+                    + "; se necesita ULUS-10041.");
+        if (!"1.05".equals(discVersion))
+            throw new IOException("tu ISO es ULUS-10041 v" + String.valueOf(discVersion)
+                    + "; el recompilado requiere exactamente v1.05.");
+    }
+
     private File ensureConfig() throws IOException {
         File config = new File(getFilesDir(), "LCSNative.ini");
         if (config.isFile()) return config;
@@ -609,9 +626,10 @@ public final class MainActivity extends Activity {
 
         final File config;
         try {
+            validateInstalledGameRevision();
             config = ensureConfig();
         } catch (IOException ex) {
-            statusView.setText("No se pudo crear la configuración: " + ex.getMessage());
+            statusView.setText("No se puede iniciar: " + ex.getMessage());
             return;
         }
 
