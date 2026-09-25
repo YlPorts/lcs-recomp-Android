@@ -41,7 +41,9 @@ struct GlesTexture {
     std::uint32_t height{};
     std::uint32_t levels{1u};
     std::uint64_t signature{};
+    std::uint64_t signature_epoch{};
     std::uint64_t last_used_epoch{};
+    std::uint64_t byte_size{};
 };
 
 struct GlesTarget {
@@ -124,6 +126,9 @@ struct GlesState {
     GLint u_present_tex{-1};
 
     std::unordered_map<std::uint64_t, GlesTexture> textures;
+    std::uint64_t texture_cache_bytes{};
+    std::uint32_t texture_cache_entry_limit{8192u};
+    std::uint64_t texture_cache_byte_limit{256ull * 1024ull * 1024ull};
     std::unordered_map<std::uint32_t, GlesTarget> targets;
     std::vector<GlesBatch> batches;
     std::vector<std::byte> last_texture_rgba;
@@ -241,6 +246,7 @@ void destroy_gl_objects(GlesState &s) noexcept {
         if (texture.id != 0u) glDeleteTextures(1, &texture.id);
     }
     s.textures.clear();
+    s.texture_cache_bytes = 0u;
     for (auto &[key, target] : s.targets) {
         (void)key;
         delete_target(target);
@@ -623,14 +629,111 @@ bool ensure_context(GlesState &s, std::string &error) {
     return true;
 }
 
+std::uint64_t hash_mix(std::uint64_t hash, std::uint64_t value) noexcept {
+    hash ^= value + 0x9E3779B97F4A7C15ull + (hash << 6u) + (hash >> 2u);
+    return hash;
+}
+
 std::uint64_t texture_key(const GeGpuDrawDescriptor &draw) noexcept {
     if (draw.texture_cache_key_hint != 0u) return draw.texture_cache_key_hint;
-    std::uint64_t key = static_cast<std::uint64_t>(draw.texture_address);
-    key ^= static_cast<std::uint64_t>(draw.texture_format) << 32u;
-    key ^= static_cast<std::uint64_t>(draw.texture_width) << 40u;
-    key ^= static_cast<std::uint64_t>(draw.texture_height) << 52u;
-    key ^= static_cast<std::uint64_t>(draw.clut_checksum) * 0x9E3779B97F4A7C15ull;
+    std::uint64_t key = 0xCBF29CE484222325ull;
+    const std::uint32_t levels =
+        draw.texture_level_addresses[0] != 0u && draw.texture_mipmap_enabled
+        ? std::min<std::uint32_t>(8u, draw.texture_max_level + 1u)
+        : 1u;
+    key = hash_mix(key, levels);
+    for (std::uint32_t level = 0u; level < levels; ++level) {
+        key = hash_mix(key,
+            draw.texture_level_addresses[level] != 0u
+                ? draw.texture_level_addresses[level] : draw.texture_address);
+        key = hash_mix(key,
+            draw.texture_level_buffer_widths[level] != 0u
+                ? draw.texture_level_buffer_widths[level] : draw.texture_buffer_width);
+        key = hash_mix(key,
+            draw.texture_level_widths[level] != 0u
+                ? draw.texture_level_widths[level] : draw.texture_width);
+        key = hash_mix(key,
+            draw.texture_level_heights[level] != 0u
+                ? draw.texture_level_heights[level] : draw.texture_height);
+    }
+    key = hash_mix(key, draw.texture_format);
+    key = hash_mix(key, draw.clut_address);
+    key = hash_mix(key, draw.clut_format);
+    key = hash_mix(key, draw.clut_shift);
+    key = hash_mix(key, draw.clut_mask);
+    key = hash_mix(key, draw.clut_start);
+    key = hash_mix(key, draw.clut_checksum);
+    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_swizzled));
+    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_min_linear));
+    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_mag_linear));
+    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_mipmap_enabled));
+    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_mipmap_linear));
+    key = hash_mix(key, draw.texture_max_level);
+    key = hash_mix(key, draw.texture_level_mode);
+    key = hash_mix(key, static_cast<std::uint32_t>(draw.texture_level_offset16));
+    key = hash_mix(key, draw.texture_selected_level);
+    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_clamp_u));
+    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_clamp_v));
     return key == 0u ? 1u : key;
+}
+
+std::uint32_t read_texture_entry_limit() noexcept {
+    const LcsConfiguration &config = lcs_render_configuration();
+    std::uint32_t fallback = config.initialized
+        ? std::clamp(config.rendering.texture_cache_entries, 256u, 16384u)
+        : 8192u;
+    if (const char *text = std::getenv("PSPRECOMP_GE_GPU_TEXTURE_DECODE_LIMIT");
+        text != nullptr && *text != '\0') {
+        char *end = nullptr;
+        const unsigned long value = std::strtoul(text, &end, 10);
+        if (end != text && *end == '\0')
+            fallback = static_cast<std::uint32_t>(
+                std::clamp<unsigned long>(value, 256u, 16384u));
+    }
+    return fallback;
+}
+
+std::uint64_t read_texture_byte_limit() noexcept {
+    const LcsConfiguration &config = lcs_render_configuration();
+    std::uint64_t mb = config.initialized
+        ? std::clamp<std::uint32_t>(config.rendering.texture_cache_mb, 32u, 512u)
+        : 256u;
+    if (const char *text = std::getenv("PSPRECOMP_GE_GPU_TEXTURE_CACHE_MB");
+        text != nullptr && *text != '\0') {
+        char *end = nullptr;
+        const unsigned long value = std::strtoul(text, &end, 10);
+        if (end != text && *end == '\0')
+            mb = std::clamp<unsigned long>(value, 32u, 512u);
+    }
+    return mb * 1024ull * 1024ull;
+}
+
+void trim_texture_cache(GlesState &s, bool aggressive) {
+    const auto over_budget = [&]() {
+        return s.textures.size() > s.texture_cache_entry_limit ||
+               s.texture_cache_bytes > s.texture_cache_byte_limit;
+    };
+
+    while (over_budget()) {
+        auto victim = s.textures.end();
+        for (auto it = s.textures.begin(); it != s.textures.end(); ++it) {
+            // Never delete a texture referenced by batches accumulated for the
+            // frame currently being drawn.
+            if (it->second.last_used_epoch >= s.frame_epoch) continue;
+            if (!aggressive && it->second.last_used_epoch + 2u >= s.frame_epoch)
+                continue;
+            if (victim == s.textures.end() ||
+                it->second.last_used_epoch < victim->second.last_used_epoch)
+                victim = it;
+        }
+        if (victim == s.textures.end()) break;
+
+        if (victim->second.id != 0u) glDeleteTextures(1, &victim->second.id);
+        s.texture_cache_bytes -=
+            std::min(s.texture_cache_bytes, victim->second.byte_size);
+        s.textures.erase(victim);
+        ++s.report.evicted_textures;
+    }
 }
 
 GlesTarget &target_metadata(GlesState &s, std::uint32_t address) {
@@ -1179,6 +1282,10 @@ bool initialize_ge_gpu_backend(std::string &error) {
         return true;
     }
 
+    s.texture_cache_entry_limit = read_texture_entry_limit();
+    s.texture_cache_byte_limit = read_texture_byte_limit();
+    s.texture_cache_bytes = 0u;
+
     s.report.requested = GeGpuBackendKind::OpenGLES;
     s.report.active = GeGpuBackendKind::OpenGLES;
     s.report.message = "OpenGL ES 3 mobile GE backend";
@@ -1280,15 +1387,40 @@ bool ge_gpu_backend_stage_vertices(
 bool ge_gpu_backend_texture_needed(
     const GeGpuDrawDescriptor &draw) noexcept {
     GlesState &s = state();
-    if (!s.enabled || !draw.texture_enabled) return false;
+    if (!s.enabled || !draw.texture_enabled || draw.texture_format > 10u ||
+        draw.texture_width == 0u || draw.texture_height == 0u)
+        return false;
+
+    const std::uint32_t feedback_address =
+        draw.texture_address & 0x001FFFF0u;
+    if (s.targets.find(feedback_address) != s.targets.end()) {
+        ++s.report.texture_cache_hits;
+        return false;
+    }
+
+    ++s.report.texture_decode_requests;
     const auto found = s.textures.find(texture_key(draw));
-    return found == s.textures.end() ||
-        (draw.texture_content_signature != 0u &&
-         found->second.signature != draw.texture_content_signature);
+    if (found == s.textures.end()) return true;
+
+    found->second.signature_epoch = s.frame_epoch;
+    found->second.last_used_epoch = s.frame_epoch;
+    if (draw.texture_content_signature != 0u &&
+        found->second.signature != draw.texture_content_signature)
+        return true;
+
+    ++s.report.texture_cache_hits;
+    return false;
 }
 
 void ge_gpu_backend_prepare_texture_keys(
     GeGpuDrawDescriptor &draw) noexcept {
+    if (!draw.texture_enabled) {
+        draw.texture_cache_key_hint = 0u;
+        draw.texture_image_key_hint = 0u;
+        return;
+    }
+    draw.texture_cache_key_hint = 0u;
+    draw.texture_image_key_hint = 0u;
     const std::uint64_t key = texture_key(draw);
     draw.texture_cache_key_hint = key;
     draw.texture_image_key_hint = key;
@@ -1296,7 +1428,15 @@ void ge_gpu_backend_prepare_texture_keys(
 
 bool ge_gpu_backend_texture_signature_needed(
     const GeGpuDrawDescriptor &draw) noexcept {
-    return ge_gpu_backend_texture_needed(draw);
+    GlesState &s = state();
+    if (!s.enabled || !draw.texture_enabled ||
+        draw.texture_width == 0u || draw.texture_height == 0u)
+        return false;
+    if (s.targets.find(draw.texture_address & 0x001FFFF0u) != s.targets.end())
+        return false;
+    const auto found = s.textures.find(texture_key(draw));
+    return found == s.textures.end() ||
+           found->second.signature_epoch != s.frame_epoch;
 }
 
 bool ge_gpu_backend_is_framebuffer_feedback_texture(
@@ -1384,24 +1524,8 @@ bool ge_gpu_backend_upload_decoded_texture_chain_packed(
 
     const std::uint64_t key = texture_key(draw);
 
-    // Keep the mobile GPU cache bounded. Loading a new area can upload hundreds
-    // of PSP textures in a burst; an unbounded map can push the driver into OOM
-    // on mid-range phones and terminate the process without a C++ exception.
-    if (s.textures.find(key) == s.textures.end() && s.textures.size() >= 256u) {
-        auto victim = s.textures.end();
-        for (auto it = s.textures.begin(); it != s.textures.end(); ++it) {
-            if (victim == s.textures.end() ||
-                it->second.last_used_epoch < victim->second.last_used_epoch)
-                victim = it;
-        }
-        if (victim != s.textures.end()) {
-            if (victim->second.id != 0u) glDeleteTextures(1, &victim->second.id);
-            s.textures.erase(victim);
-            ++s.report.evicted_textures;
-        }
-    }
-
-    GlesTexture &texture = s.textures[key];
+    auto [texture_it, inserted] = s.textures.try_emplace(key);
+    GlesTexture &texture = texture_it->second;
     if (texture.id == 0u) {
         glGenTextures(1, &texture.id);
         ++s.report.texture_images_created;
@@ -1410,6 +1534,19 @@ bool ge_gpu_backend_upload_decoded_texture_chain_packed(
     glBindTexture(GL_TEXTURE_2D, texture.id);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
+    const bool same_layout =
+        !inserted &&
+        texture.width == base_width &&
+        texture.height == base_height &&
+        texture.levels == mip_levels;
+
+    if (!same_layout) {
+        s.texture_cache_bytes -=
+            std::min(s.texture_cache_bytes, texture.byte_size);
+        texture.byte_size = rgba8.size();
+        s.texture_cache_bytes += texture.byte_size;
+    }
+
     std::size_t offset = 0u;
     std::uint32_t width = base_width;
     std::uint32_t height = base_height;
@@ -1417,9 +1554,20 @@ bool ge_gpu_backend_upload_decoded_texture_chain_packed(
         const std::size_t bytes =
             static_cast<std::size_t>(width) * height * 4u;
         if (offset + bytes > rgba8.size()) return false;
-        glTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(level), GL_RGBA8,
-                     static_cast<GLsizei>(width), static_cast<GLsizei>(height),
-                     0, GL_RGBA, GL_UNSIGNED_BYTE, rgba8.data() + offset);
+
+        if (same_layout) {
+            glTexSubImage2D(GL_TEXTURE_2D, static_cast<GLint>(level),
+                            0, 0,
+                            static_cast<GLsizei>(width),
+                            static_cast<GLsizei>(height),
+                            GL_RGBA, GL_UNSIGNED_BYTE, rgba8.data() + offset);
+        } else {
+            glTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(level), GL_RGBA8,
+                         static_cast<GLsizei>(width),
+                         static_cast<GLsizei>(height),
+                         0, GL_RGBA, GL_UNSIGNED_BYTE, rgba8.data() + offset);
+        }
+
         offset += bytes;
         width = std::max<std::uint32_t>(1u, width >> 1u);
         height = std::max<std::uint32_t>(1u, height >> 1u);
@@ -1431,7 +1579,12 @@ bool ge_gpu_backend_upload_decoded_texture_chain_packed(
     texture.height = base_height;
     texture.levels = mip_levels;
     texture.signature = draw.texture_content_signature;
+    texture.signature_epoch = s.frame_epoch;
     texture.last_used_epoch = s.frame_epoch;
+
+    // Only trim entries not referenced by this frame. Temporary overflow is
+    // safer than deleting a texture still needed by queued draw batches.
+    trim_texture_cache(s, false);
 
     s.last_texture_rgba = rgba8;
     ++s.report.decoded_texture_uploads;
@@ -1602,6 +1755,8 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
                          " avgGlesMs=" + std::to_string(average_ms) +
                          " targets=" + std::to_string(s.targets.size()) +
                          " textures=" + std::to_string(s.textures.size()) +
+                         " cacheMB=" + std::to_string(
+                             s.texture_cache_bytes / (1024u * 1024u)) +
                          " draws=" + std::to_string(s.report.game_draw_calls) +
                          " texUploads=" + std::to_string(s.report.decoded_texture_uploads) +
                          " texMB=" + std::to_string(
@@ -1618,19 +1773,9 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
 
     s.batches.clear();
 
-    // Evict long-unused decoded PSP textures without touching textures used by
-    // recent frames.
-    if ((s.frame_epoch % 120u) == 0u && s.textures.size() > 512u) {
-        for (auto it = s.textures.begin(); it != s.textures.end();) {
-            if (it->second.last_used_epoch + 240u < s.frame_epoch) {
-                if (it->second.id != 0u) glDeleteTextures(1, &it->second.id);
-                it = s.textures.erase(it);
-                ++s.report.evicted_textures;
-            } else {
-                ++it;
-            }
-        }
-    }
+    // All draw batches for this frame are now complete, so old cache entries
+    // can be evicted safely if the configured memory/entry budget was exceeded.
+    trim_texture_cache(s, true);
     ++s.frame_epoch;
     return presented;
 }
