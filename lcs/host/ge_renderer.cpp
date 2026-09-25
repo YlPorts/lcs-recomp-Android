@@ -3,6 +3,9 @@
 #include "lcs_controls.hpp"
 #include "lcs_fps_overlay.hpp"
 #include "lcs_render_config.hpp"
+#if defined(__ANDROID__)
+#include "android_host.hpp"
+#endif
 
 #include "psprecomp/common.hpp"
 
@@ -511,6 +514,19 @@ struct Vertex {
     float inv_w{1.0f};
     float fog_factor{1.0f};
 };
+
+#if defined(__ANDROID__)
+inline float android_ultrawide_x_scale() noexcept {
+    const float scale = android_host::ultrawide_x_scale();
+    return std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
+}
+
+inline void apply_android_3d_ultrawide(Vertex &vertex) noexcept {
+    const float scale = android_ultrawide_x_scale();
+    if (std::abs(scale - 1.0f) >= 0.001f)
+        vertex.x *= scale;
+}
+#endif
 
 thread_local bool g_collect_ge_render_stats = true;
 
@@ -4499,11 +4515,42 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             Vertex vertex{};
             if (!decode_vertex_optimized(memory, vertex_address + index * layout.stride, layout,
                                          commands, transform, vertex, error)) return false;
+#if defined(__ANDROID__)
+            // SurfaceFlinger stretches the low-resolution producer buffer to the
+            // physical ultrawide display. Compress 3D clip X by the inverse
+            // aspect stretch so the result gains horizontal FOV instead of
+            // making characters/cars look fat.
+            if (!layout.through) apply_android_3d_ultrawide(vertex);
+#endif
             record_clip_vertex(stats, vertex);
             if (layout.through) record_screen_vertex(stats, vertex);
             vertices.push_back(vertex);
         }
     }
+
+#if defined(__ANDROID__)
+    if (layout.through && !setup.clear_mode && !vertices.empty()) {
+        const float scale = android_ultrawide_x_scale();
+        if (std::abs(scale - 1.0f) >= 0.001f) {
+            float min_x = vertices.front().x;
+            float max_x = vertices.front().x;
+            for (const Vertex &vertex : vertices) {
+                min_x = std::min(min_x, vertex.x);
+                max_x = std::max(max_x, vertex.x);
+            }
+            const float source_width = static_cast<float>(
+                std::max<std::uint32_t>(1u, android_host::source_width()));
+            // Full-screen 2D quads (loading screens, fades, backgrounds) still
+            // fill the display. Smaller HUD/sprite primitives are corrected
+            // around screen center to preserve their shape on ultrawide.
+            if ((max_x - min_x) < source_width * 0.90f) {
+                const float center = source_width * 0.5f;
+                for (Vertex &vertex : vertices)
+                    vertex.x = center + (vertex.x - center) * scale;
+            }
+        }
+    }
+#endif
 
     if (layout.through && gpu_backend_enabled && !vertices.empty()) {
         float min_x = vertices.front().x;
