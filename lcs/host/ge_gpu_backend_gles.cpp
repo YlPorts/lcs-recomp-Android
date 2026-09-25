@@ -108,8 +108,6 @@ struct GlesState {
     GLint u_vertex_color_affine{-1};
 
     GLint u_tex{-1};
-    GLint u_texture_inv_size{-1};
-    GLint u_texture_coords_texel{-1};
     GLint u_texture_enabled{-1};
     GLint u_texture_function{-1};
     GLint u_texture_use_alpha{-1};
@@ -330,8 +328,6 @@ precision highp float;
 precision highp int;
 
 uniform sampler2D uTexture;
-uniform vec2 uTextureInvSize;
-uniform int uTextureCoordsTexel;
 uniform int uTextureEnabled;
 uniform int uTextureFunction;
 uniform int uTextureUseAlpha;
@@ -373,13 +369,8 @@ void main() {
     if (uTextureEnabled != 0) {
         float q = abs(vQ) < 1.0e-20 ? 1.0 : vQ;
         vec2 sampleUv = vUv / q;
-        // CPU-transformed PSP vertices carry UV in texel units. GLES texture()
-        // expects normalized coordinates, so convert using the bound texture's
-        // logical dimensions. Hardware-transform vertices keep normalized UV.
-        if (uTextureCoordsTexel != 0)
-            sampleUv *= uTextureInvSize;
-        // PSP texture origin is top-left; GL's normalized V origin is bottom-left.
-        sampleUv.y = 1.0 - sampleUv.y;
+        // Match the D3D12 backend: PSP UV has already been transformed into
+        // sampler space by the GE vertex path. Do not renormalize or flip here.
         vec4 texel = texture(uTexture, sampleUv);
         int fn = uTextureFunction & 7;
         if (fn == 0) {
@@ -500,8 +491,6 @@ void main() {
     s.u_vertex_color_affine = glGetUniformLocation(s.program, "uVertexColorAffine");
 
     s.u_tex = glGetUniformLocation(s.program, "uTexture");
-    s.u_texture_inv_size = glGetUniformLocation(s.program, "uTextureInvSize");
-    s.u_texture_coords_texel = glGetUniformLocation(s.program, "uTextureCoordsTexel");
     s.u_texture_enabled = glGetUniformLocation(s.program, "uTextureEnabled");
     s.u_texture_function = glGetUniformLocation(s.program, "uTextureFunction");
     s.u_texture_use_alpha = glGetUniformLocation(s.program, "uTextureUseAlpha");
@@ -957,38 +946,9 @@ void set_transform_uniforms(
     glUniform1i(s.u_vertex_color_affine, hw.vertex_color_affine ? 1 : 0);
 }
 
-std::pair<std::uint32_t, std::uint32_t> texture_logical_size(
-    GlesState &s, const GeGpuDrawDescriptor &draw) noexcept {
-    if (!draw.texture_enabled) return {1u, 1u};
-
-    const std::uint32_t address = draw.texture_address & 0x001FFFF0u;
-    const auto framebuffer = s.targets.find(address);
-    if (framebuffer != s.targets.end()) {
-        return {
-            std::max<std::uint32_t>(1u, framebuffer->second.logical_width),
-            std::max<std::uint32_t>(1u, framebuffer->second.logical_height)};
-    }
-
-    const auto found = s.textures.find(texture_key(draw));
-    if (found != s.textures.end()) {
-        return {
-            std::max<std::uint32_t>(1u, found->second.width),
-            std::max<std::uint32_t>(1u, found->second.height)};
-    }
-
-    return {
-        std::max<std::uint32_t>(1u, draw.texture_width),
-        std::max<std::uint32_t>(1u, draw.texture_height)};
-}
-
 void set_pixel_uniforms(GlesState &s, const GeGpuDrawDescriptor &draw,
-                        bool textured, bool texel_coordinates) {
+                        bool textured) {
     glUniform1i(s.u_tex, 0);
-    const auto [texture_width, texture_height] = texture_logical_size(s, draw);
-    glUniform2f(s.u_texture_inv_size,
-                1.0f / static_cast<float>(texture_width),
-                1.0f / static_cast<float>(texture_height));
-    glUniform1i(s.u_texture_coords_texel, texel_coordinates ? 1 : 0);
     glUniform1i(s.u_texture_enabled, textured ? 1 : 0);
     glUniform1i(s.u_texture_function, static_cast<GLint>(draw.texture_function & 7u));
     glUniform1i(s.u_texture_use_alpha, draw.texture_use_alpha ? 1 : 0);
@@ -1138,7 +1098,7 @@ bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
     const bool textured = batch.draw.texture_enabled && texture != 0u;
     if (textured) configure_texture_sampling(batch.draw, texture);
     else glBindTexture(GL_TEXTURE_2D, 0u);
-    set_pixel_uniforms(s, batch.draw, textured, !batch.hardware_transform);
+    set_pixel_uniforms(s, batch.draw, textured);
 
     glBindVertexArray(s.vao);
     glBindBuffer(GL_ARRAY_BUFFER, s.vbo);
@@ -1608,19 +1568,91 @@ bool ge_gpu_backend_copy_last_texture_rgba(
     return true;
 }
 
+bool gles_draw_state_compatible(
+    const GeGpuDrawDescriptor &a,
+    const GeGpuDrawDescriptor &b) noexcept {
+    if ((a.framebuffer_address & 0x001FFFF0u) !=
+        (b.framebuffer_address & 0x001FFFF0u)) return false;
+    if (a.framebuffer_format != b.framebuffer_format ||
+        a.framebuffer_stride != b.framebuffer_stride) return false;
+
+    if (a.scissor_x0 != b.scissor_x0 || a.scissor_y0 != b.scissor_y0 ||
+        a.scissor_x1 != b.scissor_x1 || a.scissor_y1 != b.scissor_y1)
+        return false;
+
+    if (a.texture_enabled != b.texture_enabled) return false;
+    if (a.texture_enabled) {
+        if (texture_key(a) != texture_key(b)) return false;
+        if (a.texture_function != b.texture_function ||
+            a.texture_use_alpha != b.texture_use_alpha ||
+            a.texture_double_color != b.texture_double_color ||
+            a.texture_env != b.texture_env ||
+            a.texture_min_linear != b.texture_min_linear ||
+            a.texture_mag_linear != b.texture_mag_linear ||
+            a.texture_mipmap_enabled != b.texture_mipmap_enabled ||
+            a.texture_mipmap_linear != b.texture_mipmap_linear ||
+            a.texture_clamp_u != b.texture_clamp_u ||
+            a.texture_clamp_v != b.texture_clamp_v)
+            return false;
+    }
+
+    return a.blend_enabled == b.blend_enabled &&
+           a.blend_equation == b.blend_equation &&
+           a.blend_source_factor == b.blend_source_factor &&
+           a.blend_dest_factor == b.blend_dest_factor &&
+           a.blend_fix_source == b.blend_fix_source &&
+           a.blend_fix_dest == b.blend_fix_dest &&
+           a.color_write_mask == b.color_write_mask &&
+           a.alpha_test_enabled == b.alpha_test_enabled &&
+           a.alpha_function == b.alpha_function &&
+           a.alpha_reference == b.alpha_reference &&
+           a.alpha_mask == b.alpha_mask &&
+           a.depth_test_enabled == b.depth_test_enabled &&
+           a.depth_write_enabled == b.depth_write_enabled &&
+           a.depth_function == b.depth_function &&
+           a.fog_enabled == b.fog_enabled &&
+           a.fog_color == b.fog_color &&
+           a.clear_mode == b.clear_mode &&
+           a.clear_color == b.clear_color &&
+           a.clear_alpha == b.clear_alpha &&
+           a.clear_depth == b.clear_depth;
+}
+
+bool append_or_merge_color_batch(
+    GlesState &s,
+    const GeGpuDrawDescriptor &draw,
+    std::span<const GeGpuVertex> vertices) {
+    if (!s.batches.empty()) {
+        GlesBatch &last = s.batches.back();
+        if (!last.hardware_transform && last.indices.empty() &&
+            gles_draw_state_compatible(last.draw, draw)) {
+            try {
+                last.vertices.insert(last.vertices.end(), vertices.begin(), vertices.end());
+                return true;
+            } catch (...) {
+                return false;
+            }
+        }
+    }
+
+    try {
+        GlesBatch batch{};
+        batch.draw = draw;
+        batch.vertices.assign(vertices.begin(), vertices.end());
+        s.batches.push_back(std::move(batch));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 void ge_gpu_backend_accumulate_color_triangles(
     const GeGpuDrawDescriptor &draw,
     std::span<const GeGpuVertex> triangle_vertices) noexcept {
     GlesState &s = state();
     if (!s.enabled || triangle_vertices.empty()) return;
-    try {
-        GlesBatch batch{};
-        batch.draw = draw;
-        batch.vertices.assign(triangle_vertices.begin(), triangle_vertices.end());
-        s.batches.push_back(std::move(batch));
-    } catch (...) {
+    if (!append_or_merge_color_batch(s, draw, triangle_vertices))
         ++s.report.rejected_gpu_draws;
-    }
 }
 
 void ge_gpu_backend_accumulate_hardware_triangles(
