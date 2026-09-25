@@ -32,7 +32,14 @@ ANativeWindow *g_window{};
 ANativeWindow *g_pending_window{};
 std::uint64_t g_surface_generation{};
 std::uint64_t g_applied_generation{};
+std::uint32_t g_buffer_geometry_width{};
+std::uint32_t g_buffer_geometry_height{};
 std::vector<std::uint8_t> g_rgba;
+
+std::atomic<std::uint32_t> g_display_width{0u};
+std::atomic<std::uint32_t> g_display_height{0u};
+std::atomic<std::uint32_t> g_source_width{480u};
+std::atomic<std::uint32_t> g_source_height{272u};
 
 std::atomic<std::uint32_t> g_buttons{0u};
 std::atomic<int> g_analog_x{128};
@@ -57,16 +64,8 @@ void apply_pending_surface_locked() noexcept {
     g_window = g_pending_window;
     g_pending_window = nullptr;
     g_applied_generation = g_surface_generation;
-
-    if (g_window != nullptr) {
-        // Keep the SurfaceView at its natural size and request a well-defined
-        // CPU-writable format. Android's compositor handles the actual display
-        // surface; we letterbox into the locked buffer below.
-        if (ANativeWindow_setBuffersGeometry(
-                g_window, 0, 0, WINDOW_FORMAT_RGBA_8888) != 0) {
-            log_error("ANativeWindow_setBuffersGeometry failed");
-        }
-    }
+    g_buffer_geometry_width = 0u;
+    g_buffer_geometry_height = 0u;
 }
 
 std::uint32_t bytes_per_pixel(std::uint32_t format) noexcept {
@@ -128,6 +127,24 @@ void present_rgba_locked(std::span<const std::byte> rgba,
         return;
     }
 
+    android_host::set_source_size(width, height);
+
+    // Keep the producer buffer at the game's native render resolution. The
+    // SurfaceView/SurfaceFlinger compositor performs the expensive upscale to
+    // the phone's physical resolution on the GPU. This avoids a full-screen
+    // CPU scaling pass every frame.
+    if (g_buffer_geometry_width != width || g_buffer_geometry_height != height) {
+        if (ANativeWindow_setBuffersGeometry(
+                g_window, static_cast<int32_t>(width), static_cast<int32_t>(height),
+                WINDOW_FORMAT_RGBA_8888) != 0) {
+            android_debug::note_egl_ready(false);
+            log_error("ANativeWindow_setBuffersGeometry(native) failed");
+            return;
+        }
+        g_buffer_geometry_width = width;
+        g_buffer_geometry_height = height;
+    }
+
     ANativeWindow_Buffer buffer{};
     if (ANativeWindow_lock(g_window, &buffer, nullptr) != 0 ||
         buffer.bits == nullptr || buffer.width <= 0 || buffer.height <= 0 ||
@@ -140,47 +157,28 @@ void present_rgba_locked(std::span<const std::byte> rgba,
     android_debug::note_egl_ready(true);
 
     auto *destination = static_cast<std::uint8_t *>(buffer.bits);
+    const auto *source = reinterpret_cast<const std::uint8_t *>(rgba.data());
     const std::size_t destination_row_bytes =
         static_cast<std::size_t>(buffer.stride) * 4u;
+    const std::uint32_t copy_width = std::min<std::uint32_t>(
+        width, static_cast<std::uint32_t>(buffer.width));
+    const std::uint32_t copy_height = std::min<std::uint32_t>(
+        height, static_cast<std::uint32_t>(buffer.height));
+    const std::size_t copy_bytes = static_cast<std::size_t>(copy_width) * 4u;
 
-    // Clear the whole native surface so letterbox areas are deterministic.
-    for (int y = 0; y < buffer.height; ++y) {
+    for (std::uint32_t y = 0u; y < copy_height; ++y) {
+        std::uint8_t *dst_row =
+            destination + static_cast<std::size_t>(y) * destination_row_bytes;
+        const std::uint8_t *src_row =
+            source + static_cast<std::size_t>(y) * width * 4u;
+        std::memcpy(dst_row, src_row, copy_bytes);
+        if (destination_row_bytes > copy_bytes)
+            std::memset(dst_row + copy_bytes, 0, destination_row_bytes - copy_bytes);
+    }
+    for (std::uint32_t y = copy_height;
+         y < static_cast<std::uint32_t>(buffer.height); ++y) {
         std::memset(destination + static_cast<std::size_t>(y) * destination_row_bytes,
                     0, destination_row_bytes);
-    }
-
-    const LcsConfiguration &config = lcs_render_configuration();
-    const PresentationRectangle rect = calculate_presentation_rectangle(
-        static_cast<std::uint32_t>(buffer.width),
-        static_cast<std::uint32_t>(buffer.height),
-        width, height, config.display.aspect_mode, config.display.integer_scale);
-
-    if (rect.width > 0 && rect.height > 0) {
-        const auto *source = reinterpret_cast<const std::uint8_t *>(rgba.data());
-        for (std::int32_t dy = 0; dy < rect.height; ++dy) {
-            const std::uint32_t sy = std::min<std::uint32_t>(
-                height - 1u,
-                static_cast<std::uint32_t>(
-                    (static_cast<std::uint64_t>(dy) * height) /
-                    static_cast<std::uint32_t>(rect.height)));
-
-            std::uint8_t *dst_row =
-                destination +
-                static_cast<std::size_t>(rect.y + dy) * destination_row_bytes +
-                static_cast<std::size_t>(rect.x) * 4u;
-            const std::uint8_t *src_row =
-                source + static_cast<std::size_t>(sy) * width * 4u;
-
-            for (std::int32_t dx = 0; dx < rect.width; ++dx) {
-                const std::uint32_t sx = std::min<std::uint32_t>(
-                    width - 1u,
-                    static_cast<std::uint32_t>(
-                        (static_cast<std::uint64_t>(dx) * width) /
-                        static_cast<std::uint32_t>(rect.width)));
-                std::memcpy(dst_row + static_cast<std::size_t>(dx) * 4u,
-                            src_row + static_cast<std::size_t>(sx) * 4u, 4u);
-            }
-        }
     }
 
     const bool posted = ANativeWindow_unlockAndPost(g_window) == 0;
@@ -197,6 +195,46 @@ void set_window(ANativeWindow *window) noexcept {
     if (g_pending_window != nullptr) ANativeWindow_release(g_pending_window);
     g_pending_window = window;
     ++g_surface_generation;
+}
+
+void set_display_size(std::uint32_t width, std::uint32_t height) noexcept {
+    if (width == 0u || height == 0u) return;
+    g_display_width.store(width, std::memory_order_relaxed);
+    g_display_height.store(height, std::memory_order_relaxed);
+}
+
+void set_source_size(std::uint32_t width, std::uint32_t height) noexcept {
+    if (width == 0u || height == 0u) return;
+    g_source_width.store(width, std::memory_order_relaxed);
+    g_source_height.store(height, std::memory_order_relaxed);
+}
+
+std::uint32_t display_width() noexcept {
+    return g_display_width.load(std::memory_order_relaxed);
+}
+
+std::uint32_t display_height() noexcept {
+    return g_display_height.load(std::memory_order_relaxed);
+}
+
+std::uint32_t source_width() noexcept {
+    return g_source_width.load(std::memory_order_relaxed);
+}
+
+std::uint32_t source_height() noexcept {
+    return g_source_height.load(std::memory_order_relaxed);
+}
+
+float ultrawide_x_scale() noexcept {
+    const std::uint32_t dw = display_width();
+    const std::uint32_t dh = display_height();
+    const std::uint32_t sw = source_width();
+    const std::uint32_t sh = source_height();
+    if (dw == 0u || dh == 0u || sw == 0u || sh == 0u) return 1.0f;
+    const float display_aspect = static_cast<float>(dw) / static_cast<float>(dh);
+    const float source_aspect = static_cast<float>(sw) / static_cast<float>(sh);
+    if (!(display_aspect > 0.0f) || !(source_aspect > 0.0f)) return 1.0f;
+    return std::clamp(source_aspect / display_aspect, 0.50f, 1.50f);
 }
 
 void set_input(std::uint32_t buttons, std::uint8_t analog_x, std::uint8_t analog_y,
@@ -242,6 +280,7 @@ void display_window_present(psprecomp::Runtime &runtime, std::uint32_t frame_buf
     if (now - last_present < std::chrono::milliseconds(33)) return;
     last_present = now;
 
+    android_host::set_source_size(width, height);
     android_debug::note_present_attempt(
         frame_buffer, buffer_width, pixel_format, width, height);
 
