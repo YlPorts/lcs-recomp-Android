@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.22.1)
 project(LCSRecompAndroid LANGUAGES C CXX)
 
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -32,7 +38,9 @@ target_include_directories(lcs_generated PRIVATE
     "${REPO_ROOT}/include"
     "${REPO_ROOT}/lcs/host"
 )
-target_compile_options(lcs_generated PRIVATE -O2 -fexceptions -frtti)
+# Iteration builds use O1 without debug info: the generated AOT source is ~96 MB.
+# Once the Android port is stable, release builds can switch this back to O2.
+target_compile_options(lcs_generated PRIVATE -O1 -g0 -fexceptions -frtti)
 target_compile_definitions(lcs_generated PRIVATE
     PSPRECOMP_AOT_ASSUME_NO_WRITE_WATCH=1
     PSPRECOMP_AOT_PRODUCTION_FASTPATHS=1
