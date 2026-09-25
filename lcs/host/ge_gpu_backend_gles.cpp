@@ -11,6 +11,7 @@
 #include <android/native_window.h>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -74,7 +75,7 @@ struct GlesState {
 
     std::mutex window_mutex;
     ANativeWindow *window{};
-    bool surface_dirty{true};
+    std::atomic<bool> surface_dirty{true};
 
     EGLDisplay display{EGL_NO_DISPLAY};
     EGLConfig config{};
@@ -556,7 +557,9 @@ bool ensure_context(GlesState &s, std::string &error) {
         runtime_log_line("gles: EGL context created");
     }
 
-    if (s.surface_dirty || s.surface == EGL_NO_SURFACE) {
+    const bool surface_changed =
+        s.surface_dirty.exchange(false, std::memory_order_acq_rel);
+    if (surface_changed || s.surface == EGL_NO_SURFACE) {
         if (s.surface != EGL_NO_SURFACE) {
             (void)eglMakeCurrent(s.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
             (void)eglDestroySurface(s.display, s.surface);
@@ -568,7 +571,6 @@ bool ensure_context(GlesState &s, std::string &error) {
             std::lock_guard<std::mutex> guard(s.window_mutex);
             window = s.window;
             if (window != nullptr) ANativeWindow_acquire(window);
-            s.surface_dirty = false;
         }
         if (window == nullptr) {
             error = "Android native window is not attached yet";
@@ -1460,7 +1462,7 @@ void ge_gpu_backend_set_native_window(void *native_window) noexcept {
     if (incoming != nullptr) ANativeWindow_acquire(incoming);
     if (s.window != nullptr) ANativeWindow_release(s.window);
     s.window = incoming;
-    s.surface_dirty = true;
+    s.surface_dirty.store(true, std::memory_order_release);
 }
 
 void ge_gpu_backend_set_display_framebuffer(
