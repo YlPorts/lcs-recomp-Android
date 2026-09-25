@@ -2,12 +2,9 @@
 
 #include "android_host.hpp"
 #include "android_debug.hpp"
-#include "ge_gpu_backend.hpp"
 #include "lcs_controls.hpp"
 #include "lcs_render_config.hpp"
 
-#include <EGL/egl.h>
-#include <GLES3/gl3.h>
 #include <android/log.h>
 #include <android/native_window.h>
 
@@ -35,16 +32,6 @@ ANativeWindow *g_window{};
 ANativeWindow *g_pending_window{};
 std::uint64_t g_surface_generation{};
 std::uint64_t g_applied_generation{};
-
-EGLDisplay g_egl_display{EGL_NO_DISPLAY};
-EGLSurface g_egl_surface{EGL_NO_SURFACE};
-EGLContext g_egl_context{EGL_NO_CONTEXT};
-GLuint g_program{};
-GLuint g_texture{};
-GLuint g_vao{};
-GLint g_sampler_location{-1};
-std::uint32_t g_texture_width{};
-std::uint32_t g_texture_height{};
 std::vector<std::uint8_t> g_rgba;
 
 std::atomic<std::uint32_t> g_buttons{0u};
@@ -60,54 +47,9 @@ void log_error(const char *message) {
     __android_log_print(ANDROID_LOG_ERROR, kLogTag, "%s", message);
 }
 
-GLuint compile_shader(GLenum type, const char *source) {
-    const GLuint shader = glCreateShader(type);
-    glShaderSource(shader, 1, &source, nullptr);
-    glCompileShader(shader);
-    GLint ok = GL_FALSE;
-    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
-    if (ok == GL_TRUE) return shader;
-
-    char buffer[1024]{};
-    GLsizei length = 0;
-    glGetShaderInfoLog(shader, static_cast<GLsizei>(sizeof(buffer)), &length, buffer);
-    __android_log_print(ANDROID_LOG_ERROR, kLogTag, "shader compile failed: %.*s",
-                        static_cast<int>(length), buffer);
-    glDeleteShader(shader);
-    return 0u;
-}
-
-void destroy_egl_locked() noexcept {
-    if (g_egl_display != EGL_NO_DISPLAY && g_egl_context != EGL_NO_CONTEXT) {
-        (void)eglMakeCurrent(g_egl_display, g_egl_surface, g_egl_surface, g_egl_context);
-        if (g_texture != 0u) glDeleteTextures(1, &g_texture);
-        if (g_vao != 0u) glDeleteVertexArrays(1, &g_vao);
-        if (g_program != 0u) glDeleteProgram(g_program);
-    }
-    g_texture = 0u;
-    g_vao = 0u;
-    g_program = 0u;
-    g_sampler_location = -1;
-    g_texture_width = 0u;
-    g_texture_height = 0u;
-
-    if (g_egl_display != EGL_NO_DISPLAY) {
-        (void)eglMakeCurrent(g_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        if (g_egl_surface != EGL_NO_SURFACE)
-            (void)eglDestroySurface(g_egl_display, g_egl_surface);
-        if (g_egl_context != EGL_NO_CONTEXT)
-            (void)eglDestroyContext(g_egl_display, g_egl_context);
-        (void)eglTerminate(g_egl_display);
-    }
-    g_egl_surface = EGL_NO_SURFACE;
-    g_egl_context = EGL_NO_CONTEXT;
-    g_egl_display = EGL_NO_DISPLAY;
-}
-
 void apply_pending_surface_locked() noexcept {
     if (g_applied_generation == g_surface_generation) return;
 
-    destroy_egl_locked();
     if (g_window != nullptr) {
         ANativeWindow_release(g_window);
         g_window = nullptr;
@@ -115,139 +57,16 @@ void apply_pending_surface_locked() noexcept {
     g_window = g_pending_window;
     g_pending_window = nullptr;
     g_applied_generation = g_surface_generation;
-}
 
-bool create_program_locked() {
-    static constexpr char kVertexShader[] = R"(
-        #version 300 es
-        precision mediump float;
-        out vec2 v_uv;
-        void main() {
-            vec2 p;
-            if (gl_VertexID == 0) p = vec2(-1.0, -1.0);
-            else if (gl_VertexID == 1) p = vec2(3.0, -1.0);
-            else p = vec2(-1.0, 3.0);
-            gl_Position = vec4(p, 0.0, 1.0);
-            vec2 uv = (p + 1.0) * 0.5;
-            v_uv = vec2(uv.x, 1.0 - uv.y);
+    if (g_window != nullptr) {
+        // Keep the SurfaceView at its natural size and request a well-defined
+        // CPU-writable format. Android's compositor handles the actual display
+        // surface; we letterbox into the locked buffer below.
+        if (ANativeWindow_setBuffersGeometry(
+                g_window, 0, 0, WINDOW_FORMAT_RGBA_8888) != 0) {
+            log_error("ANativeWindow_setBuffersGeometry failed");
         }
-    )";
-    static constexpr char kFragmentShader[] = R"(
-        #version 300 es
-        precision mediump float;
-        uniform sampler2D u_texture;
-        in vec2 v_uv;
-        out vec4 out_color;
-        void main() {
-            out_color = texture(u_texture, v_uv);
-        }
-    )";
-
-    const GLuint vs = compile_shader(GL_VERTEX_SHADER, kVertexShader);
-    const GLuint fs = compile_shader(GL_FRAGMENT_SHADER, kFragmentShader);
-    if (vs == 0u || fs == 0u) {
-        if (vs != 0u) glDeleteShader(vs);
-        if (fs != 0u) glDeleteShader(fs);
-        return false;
     }
-
-    g_program = glCreateProgram();
-    glAttachShader(g_program, vs);
-    glAttachShader(g_program, fs);
-    glLinkProgram(g_program);
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-
-    GLint linked = GL_FALSE;
-    glGetProgramiv(g_program, GL_LINK_STATUS, &linked);
-    if (linked != GL_TRUE) {
-        char buffer[1024]{};
-        GLsizei length = 0;
-        glGetProgramInfoLog(g_program, static_cast<GLsizei>(sizeof(buffer)), &length, buffer);
-        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "program link failed: %.*s",
-                            static_cast<int>(length), buffer);
-        glDeleteProgram(g_program);
-        g_program = 0u;
-        return false;
-    }
-
-    g_sampler_location = glGetUniformLocation(g_program, "u_texture");
-    glGenVertexArrays(1, &g_vao);
-    glGenTextures(1, &g_texture);
-    glBindTexture(GL_TEXTURE_2D, g_texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    return g_vao != 0u && g_texture != 0u;
-}
-
-bool ensure_egl_locked() {
-    apply_pending_surface_locked();
-    if (g_window == nullptr) return false;
-    if (g_egl_display != EGL_NO_DISPLAY && g_egl_surface != EGL_NO_SURFACE &&
-        g_egl_context != EGL_NO_CONTEXT)
-        return true;
-
-    g_egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    if (g_egl_display == EGL_NO_DISPLAY || !eglInitialize(g_egl_display, nullptr, nullptr)) {
-        android_debug::note_egl_ready(false);
-        log_error("eglInitialize failed");
-        destroy_egl_locked();
-        return false;
-    }
-
-    static constexpr EGLint kConfigAttributes[] = {
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
-        EGL_RED_SIZE, 8,
-        EGL_GREEN_SIZE, 8,
-        EGL_BLUE_SIZE, 8,
-        EGL_ALPHA_SIZE, 8,
-        EGL_NONE
-    };
-    EGLConfig config{};
-    EGLint config_count = 0;
-    if (!eglChooseConfig(g_egl_display, kConfigAttributes, &config, 1, &config_count) ||
-        config_count == 0) {
-        android_debug::note_egl_ready(false);
-        log_error("eglChooseConfig failed");
-        destroy_egl_locked();
-        return false;
-    }
-
-    EGLint native_format = 0;
-    (void)eglGetConfigAttrib(g_egl_display, config, EGL_NATIVE_VISUAL_ID, &native_format);
-    (void)ANativeWindow_setBuffersGeometry(g_window, 0, 0, native_format);
-
-    static constexpr EGLint kContextAttributes[] = {
-        EGL_CONTEXT_CLIENT_VERSION, 3,
-        EGL_NONE
-    };
-    g_egl_context = eglCreateContext(
-        g_egl_display, config, EGL_NO_CONTEXT, kContextAttributes);
-    if (g_egl_context == EGL_NO_CONTEXT) {
-        android_debug::note_egl_ready(false);
-        log_error("eglCreateContext ES3 failed");
-        destroy_egl_locked();
-        return false;
-    }
-
-    g_egl_surface = eglCreateWindowSurface(g_egl_display, config, g_window, nullptr);
-    if (g_egl_surface == EGL_NO_SURFACE ||
-        !eglMakeCurrent(g_egl_display, g_egl_surface, g_egl_surface, g_egl_context)) {
-        android_debug::note_egl_ready(false);
-        log_error("eglCreateWindowSurface/eglMakeCurrent failed");
-        destroy_egl_locked();
-        return false;
-    }
-
-    (void)eglSwapInterval(g_egl_display, 1);
-    if (!create_program_locked()) {
-        android_debug::note_egl_ready(false);
-        destroy_egl_locked();
-        return false;
-    }
-    android_debug::note_egl_ready(true);
-    return true;
 }
 
 std::uint32_t bytes_per_pixel(std::uint32_t format) noexcept {
@@ -261,7 +80,7 @@ void unpack_rgba(const std::uint8_t *source, std::uint32_t format,
     std::uint32_t b = 0u;
     std::uint32_t a = 255u;
     switch (format) {
-    case 0u: {
+    case 0u: {  // GU_PSM_5650
         const std::uint16_t value =
             static_cast<std::uint16_t>(source[0] | (source[1] << 8u));
         r = (value & 0x1Fu) * 255u / 31u;
@@ -269,7 +88,7 @@ void unpack_rgba(const std::uint8_t *source, std::uint32_t format,
         b = ((value >> 11u) & 0x1Fu) * 255u / 31u;
         break;
     }
-    case 1u: {
+    case 1u: {  // GU_PSM_5551
         const std::uint16_t value =
             static_cast<std::uint16_t>(source[0] | (source[1] << 8u));
         r = (value & 0x1Fu) * 255u / 31u;
@@ -278,7 +97,7 @@ void unpack_rgba(const std::uint8_t *source, std::uint32_t format,
         a = (value & 0x8000u) != 0u ? 255u : 0u;
         break;
     }
-    case 2u: {
+    case 2u: {  // GU_PSM_4444
         const std::uint16_t value =
             static_cast<std::uint16_t>(source[0] | (source[1] << 8u));
         r = (value & 0xFu) * 17u;
@@ -287,7 +106,7 @@ void unpack_rgba(const std::uint8_t *source, std::uint32_t format,
         a = ((value >> 12u) & 0xFu) * 17u;
         break;
     }
-    default:
+    default:  // GU_PSM_8888
         r = source[0];
         g = source[1];
         b = source[2];
@@ -302,59 +121,71 @@ void unpack_rgba(const std::uint8_t *source, std::uint32_t format,
 
 void present_rgba_locked(std::span<const std::byte> rgba,
                          std::uint32_t width, std::uint32_t height) {
-    if (width == 0u || height == 0u ||
-        rgba.size() < static_cast<std::size_t>(width) * height * 4u ||
-        !ensure_egl_locked())
+    apply_pending_surface_locked();
+    if (g_window == nullptr || width == 0u || height == 0u ||
+        rgba.size() < static_cast<std::size_t>(width) * height * 4u) {
+        android_debug::note_egl_ready(false);
         return;
+    }
 
-    EGLint surface_width = 0;
-    EGLint surface_height = 0;
-    if (!eglQuerySurface(g_egl_display, g_egl_surface, EGL_WIDTH, &surface_width) ||
-        !eglQuerySurface(g_egl_display, g_egl_surface, EGL_HEIGHT, &surface_height) ||
-        surface_width <= 0 || surface_height <= 0)
+    ANativeWindow_Buffer buffer{};
+    if (ANativeWindow_lock(g_window, &buffer, nullptr) != 0 ||
+        buffer.bits == nullptr || buffer.width <= 0 || buffer.height <= 0 ||
+        buffer.stride <= 0) {
+        android_debug::note_egl_ready(false);
+        log_error("ANativeWindow_lock failed");
         return;
+    }
+
+    android_debug::note_egl_ready(true);
+
+    auto *destination = static_cast<std::uint8_t *>(buffer.bits);
+    const std::size_t destination_row_bytes =
+        static_cast<std::size_t>(buffer.stride) * 4u;
+
+    // Clear the whole native surface so letterbox areas are deterministic.
+    for (int y = 0; y < buffer.height; ++y) {
+        std::memset(destination + static_cast<std::size_t>(y) * destination_row_bytes,
+                    0, destination_row_bytes);
+    }
 
     const LcsConfiguration &config = lcs_render_configuration();
     const PresentationRectangle rect = calculate_presentation_rectangle(
-        static_cast<std::uint32_t>(surface_width),
-        static_cast<std::uint32_t>(surface_height),
+        static_cast<std::uint32_t>(buffer.width),
+        static_cast<std::uint32_t>(buffer.height),
         width, height, config.display.aspect_mode, config.display.integer_scale);
 
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_BLEND);
-    glViewport(0, 0, surface_width, surface_height);
-    glClearColor(0.f, 0.f, 0.f, 1.f);
-    glClear(GL_COLOR_BUFFER_BIT);
+    if (rect.width > 0 && rect.height > 0) {
+        const auto *source = reinterpret_cast<const std::uint8_t *>(rgba.data());
+        for (std::int32_t dy = 0; dy < rect.height; ++dy) {
+            const std::uint32_t sy = std::min<std::uint32_t>(
+                height - 1u,
+                static_cast<std::uint32_t>(
+                    (static_cast<std::uint64_t>(dy) * height) /
+                    static_cast<std::uint32_t>(rect.height)));
 
-    glViewport(rect.x, rect.y, rect.width, rect.height);
-    glUseProgram(g_program);
-    glBindVertexArray(g_vao);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_texture);
+            std::uint8_t *dst_row =
+                destination +
+                static_cast<std::size_t>(rect.y + dy) * destination_row_bytes +
+                static_cast<std::size_t>(rect.x) * 4u;
+            const std::uint8_t *src_row =
+                source + static_cast<std::size_t>(sy) * width * 4u;
 
-    const GLint filter = config.display.upscale_filter == DisplayUpscaleFilter::Nearest
-        ? GL_NEAREST : GL_LINEAR;
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-
-    const auto *pixels = reinterpret_cast<const std::uint8_t *>(rgba.data());
-    if (g_texture_width != width || g_texture_height != height) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
-                     static_cast<GLsizei>(width), static_cast<GLsizei>(height),
-                     0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-        g_texture_width = width;
-        g_texture_height = height;
-    } else {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
-                        static_cast<GLsizei>(width), static_cast<GLsizei>(height),
-                        GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+            for (std::int32_t dx = 0; dx < rect.width; ++dx) {
+                const std::uint32_t sx = std::min<std::uint32_t>(
+                    width - 1u,
+                    static_cast<std::uint32_t>(
+                        (static_cast<std::uint64_t>(dx) * width) /
+                        static_cast<std::uint32_t>(rect.width)));
+                std::memcpy(dst_row + static_cast<std::size_t>(dx) * 4u,
+                            src_row + static_cast<std::size_t>(sx) * 4u, 4u);
+            }
+        }
     }
 
-    if (g_sampler_location >= 0) glUniform1i(g_sampler_location, 0);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-    const bool swapped = eglSwapBuffers(g_egl_display, g_egl_surface) == EGL_TRUE;
-    android_debug::note_swap(swapped);
+    const bool posted = ANativeWindow_unlockAndPost(g_window) == 0;
+    android_debug::note_swap(posted);
+    if (!posted) log_error("ANativeWindow_unlockAndPost failed");
 }
 
 }  // namespace
@@ -411,15 +242,21 @@ void display_window_present(psprecomp::Runtime &runtime, std::uint32_t frame_buf
     if (now - last_present < std::chrono::milliseconds(33)) return;
     last_present = now;
 
-    android_debug::note_present_attempt(frame_buffer, buffer_width, pixel_format, width, height);
-    if (frame_buffer == 0u || width == 0u || height == 0u || buffer_width == 0u) {
+    android_debug::note_present_attempt(
+        frame_buffer, buffer_width, pixel_format, width, height);
+
+    if (frame_buffer == 0u || width == 0u || height == 0u ||
+        buffer_width == 0u || pixel_format > 3u) {
         android_debug::note_present_pixels(0u, 0u);
         return;
     }
+
     const std::uint32_t bpp = bytes_per_pixel(pixel_format);
-    const std::uint32_t stride = buffer_width * bpp;
-    const std::size_t total = static_cast<std::size_t>(stride) * height;
-    const std::uint8_t *source = runtime.memory().raw_pointer(frame_buffer, total);
+    const std::uint32_t stride_bytes = buffer_width * bpp;
+    const std::size_t total_bytes =
+        static_cast<std::size_t>(stride_bytes) * height;
+    const std::uint8_t *source =
+        runtime.memory().raw_pointer(frame_buffer, total_bytes);
     if (source == nullptr) {
         android_debug::note_present_pixels(0u, 0u);
         return;
@@ -428,19 +265,26 @@ void display_window_present(psprecomp::Runtime &runtime, std::uint32_t frame_buf
     g_rgba.resize(static_cast<std::size_t>(width) * height * 4u);
     std::uint64_t non_black = 0u;
     for (std::uint32_t y = 0u; y < height; ++y) {
-        const std::uint8_t *row = source + static_cast<std::size_t>(y) * stride;
+        const std::uint8_t *row =
+            source + static_cast<std::size_t>(y) * stride_bytes;
         for (std::uint32_t x = 0u; x < width; ++x) {
-            std::uint8_t *destination =
-                g_rgba.data() + (static_cast<std::size_t>(y) * width + x) * 4u;
-            unpack_rgba(row + static_cast<std::size_t>(x) * bpp, pixel_format, destination);
-            if (destination[0] != 0u || destination[1] != 0u || destination[2] != 0u)
+            std::uint8_t *pixel =
+                g_rgba.data() +
+                (static_cast<std::size_t>(y) * width + x) * 4u;
+            unpack_rgba(row + static_cast<std::size_t>(x) * bpp,
+                        pixel_format, pixel);
+            if (pixel[0] != 0u || pixel[1] != 0u || pixel[2] != 0u)
                 ++non_black;
         }
     }
-    android_debug::note_present_pixels(non_black,
-        static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height));
 
-    const auto bytes = std::as_bytes(std::span<const std::uint8_t>(g_rgba));
+    android_debug::note_present_pixels(
+        non_black,
+        static_cast<std::uint64_t>(width) *
+            static_cast<std::uint64_t>(height));
+
+    const auto bytes =
+        std::as_bytes(std::span<const std::uint8_t>(g_rgba));
     std::lock_guard<std::mutex> guard(g_surface_mutex);
     present_rgba_locked(bytes, width, height);
 }
@@ -453,7 +297,6 @@ void display_window_present_rgba(std::span<const std::byte> rgba,
 
 void display_window_shutdown() {
     std::lock_guard<std::mutex> guard(g_surface_mutex);
-    destroy_egl_locked();
     if (g_window != nullptr) {
         ANativeWindow_release(g_window);
         g_window = nullptr;
@@ -471,15 +314,20 @@ HostInputState display_window_input() {
         std::clamp(g_analog_x.load(std::memory_order_relaxed), 0, 255));
     input.analog_y = static_cast<std::uint8_t>(
         std::clamp(g_analog_y.load(std::memory_order_relaxed), 0, 255));
-    input.camera_x = std::clamp(g_camera_x.load(std::memory_order_relaxed), -127, 127);
-    input.camera_y = std::clamp(g_camera_y.load(std::memory_order_relaxed), -127, 127);
+    input.camera_x =
+        std::clamp(g_camera_x.load(std::memory_order_relaxed), -127, 127);
+    input.camera_y =
+        std::clamp(g_camera_y.load(std::memory_order_relaxed), -127, 127);
     input.accelerate = g_accelerate.load(std::memory_order_relaxed);
     input.brake = g_brake.load(std::memory_order_relaxed);
 
     if (lcs_player_in_vehicle()) {
-        if ((input.buttons & (kPspCross | kPspRTrigger)) != 0u) input.accelerate = true;
-        if ((input.buttons & (kPspSquare | kPspLTrigger)) != 0u) input.brake = true;
+        if ((input.buttons & (kPspCross | kPspRTrigger)) != 0u)
+            input.accelerate = true;
+        if ((input.buttons & (kPspSquare | kPspLTrigger)) != 0u)
+            input.brake = true;
     }
+
     lcs_camera_set_axes(input.camera_x, input.camera_y);
     lcs_set_host_drive_inputs(input.accelerate, input.brake);
     return input;
