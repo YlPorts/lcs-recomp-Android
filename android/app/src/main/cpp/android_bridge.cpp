@@ -100,9 +100,12 @@ Java_com_ylports_lcsrecomp_MainActivity_nativeRun(
     // instead of repeatedly waiting on a decoder that can never produce a frame.
     setenv("LCS_SKIP_MPEG", "1", 1);
 
-    // The native-window presentation path is stable now, so let the GE worker
-    // overlap software rendering with guest CPU execution again.
-    setenv("LCS_GE_ASYNC", "1", 1);
+    // EGL contexts are thread-affine. The first GLES build let the GE worker
+    // accumulate/upload on one thread while vblank presentation used another,
+    // racing the same context, texture maps and batch vectors. Keep the GPU
+    // renderer on the native game thread; rasterization still happens on the
+    // GPU, so this does NOT restore the old CPU pixel bottleneck.
+    setenv("LCS_GE_ASYNC", "0", 1);
 
     // Mobile software-raster tuning for the 2+6 core layout common on midrange
     // ARM phones. Six row workers plus the GE/game threads keeps all cores busy
