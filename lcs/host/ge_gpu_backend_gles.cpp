@@ -22,6 +22,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -67,6 +68,7 @@ struct GlesState {
     bool enabled{};
     bool gl_ready{};
     bool direct_present_ok{};
+    std::thread::id gl_thread{};
     std::uint32_t scale{2u};
     std::uint64_t frame_epoch{1u};
 
@@ -504,6 +506,13 @@ bool ensure_context(GlesState &s, std::string &error) {
         return false;
     }
 
+    const std::thread::id current_thread = std::this_thread::get_id();
+    if (s.gl_ready && s.gl_thread != std::thread::id{} &&
+        s.gl_thread != current_thread) {
+        error = "OpenGL ES context attempted from a second native thread";
+        return false;
+    }
+
     if (s.display == EGL_NO_DISPLAY) {
         s.display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
         if (s.display == EGL_NO_DISPLAY || !eglInitialize(s.display, nullptr, nullptr)) {
@@ -577,6 +586,7 @@ bool ensure_context(GlesState &s, std::string &error) {
 
     if (!s.gl_ready) {
         if (!create_gl_objects(s, error)) return false;
+        s.gl_thread = current_thread;
         (void)eglSwapInterval(s.display, 0);
         const char *renderer =
             reinterpret_cast<const char *>(glGetString(GL_RENDERER));
@@ -1075,6 +1085,7 @@ void destroy_backend(GlesState &s) noexcept {
         s.window = nullptr;
     }
 
+    s.gl_thread = {};
     s.initialized = false;
     s.enabled = false;
     s.direct_present_ok = false;
