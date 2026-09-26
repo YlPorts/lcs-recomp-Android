@@ -27,3 +27,5 @@ Synthetic texture errors are reproduced and corrected, but this does not establi
 To capture a remaining material problem, open Back > Capturar un fotograma in the affected scene, then export the completed ZIP from the launcher. Capture is opt-in and causes a one-off pause; do not use that frame to judge FPS. The inspector `android/tools/inspect_render_capture.py` reads the ZIP locally.
 
 The existing application ID, touch controls, 1x/2x preference and audio implementation are retained. Signing compatibility depends on the build key: the previous CI used an ephemeral Android debug key, which is not in this repository. A locally signed build cannot replace it unless the original private key is available. Do not assume that uninstalling preserves internal app data.
+
+An optional `-PlcsParallelInstall=true` Gradle build uses `com.ylports.lcsrecomp.preview` and the launcher label `LCS Recomp 0.6.16 Prueba`. It installs alongside the existing app and does not modify its internal data. Select the game folder in the new installation; preferences and private saves are separate. Without this property, the normal package and label are unchanged.

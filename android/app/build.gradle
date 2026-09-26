@@ -2,13 +2,18 @@ plugins {
     id "com.android.application"
 }
 
+// A separate optional install is useful when the previous CI debug signing key
+// was ephemeral. Keep the normal package unchanged for matching-key builds.
+def parallelInstall = providers.gradleProperty("lcsParallelInstall").orNull == "true"
+
 android {
     namespace "com.ylports.lcsrecomp"
     compileSdk 35
     ndkVersion "27.2.12479018"
 
     defaultConfig {
-        applicationId "com.ylports.lcsrecomp"
+        applicationId (parallelInstall ? "com.ylports.lcsrecomp.preview" : "com.ylports.lcsrecomp")
+        manifestPlaceholders = [lcsAppLabel: parallelInstall ? "LCS Recomp 0.6.16 Prueba" : "@string/app_name"]
         minSdk 26
         targetSdk 35
         versionCode 22
