@@ -26,8 +26,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Apply checked 0.6.11 source update
-        run: python3 android/tools/repair_0611.py
+        with:
+          fetch-depth: 3
+      - name: Apply checked 0.6.12 source update
+        run: python3 android/tools/repair_0612.py
       - name: Component and audio regression tests
         run: |
           mkdir -p android/test-results
@@ -51,6 +53,24 @@ jobs:
         run: |
           g++ -std=c++20 -O2 -ffunction-sections -fdata-sections -Iinclude -Ilcs/host android/tests/lighting_cache_regression.cpp src/guest_memory.cpp -Wl,--gc-sections -pthread -o /tmp/lighting-cache
           /tmp/lighting-cache | tee android/test-results/lighting-cache.txt
+      - name: GE command state and record reuse regressions
+        run: |
+          set -euo pipefail
+          python3 android/tests/scale_config_regression.py | tee android/test-results/scale-config.txt
+          for mode in optimized sanitized; do
+            FLAGS="-std=c++20 -O2 -ffunction-sections -fdata-sections -Iinclude -Ilcs/host"
+            if [ "$mode" = sanitized ]; then FLAGS="-std=c++20 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -ffunction-sections -fdata-sections -Iinclude -Ilcs/host"; fi
+            g++ $FLAGS -Drender_ge_primitive=test_capture_primitive -Dflush_ge_deferred_rasterization=test_flush -c lcs/host/lcs_ge_exec.cpp -o /tmp/ge-exec-$mode.o
+            g++ $FLAGS android/tests/ge_command_state_regression.cpp src/guest_memory.cpp /tmp/ge-exec-$mode.o -Wl,--gc-sections -pthread -o /tmp/ge-state-$mode
+            /tmp/ge-state-$mode | tee android/test-results/ge-state-$mode.txt
+            g++ $FLAGS android/tests/vertex_memo_regression.cpp src/guest_memory.cpp -Wl,--gc-sections -pthread -o /tmp/vertex-memo-$mode
+            /tmp/vertex-memo-$mode | tee android/test-results/vertex-memo-$mode.txt
+          done
+          git show 2bd2ce61a3e155595c1eeb131cccd41b287aa6bb:lcs/host/lcs_ge_exec.cpp > /tmp/ge-exec-before.cpp
+          g++ -std=c++20 -O2 -ffunction-sections -fdata-sections -Iinclude -Ilcs/host -Drender_ge_primitive=test_capture_primitive -Dflush_ge_deferred_rasterization=test_flush -c /tmp/ge-exec-before.cpp -o /tmp/ge-exec-before.o
+          g++ -std=c++20 -O2 -ffunction-sections -fdata-sections -Iinclude -Ilcs/host android/tests/ge_command_state_regression.cpp src/guest_memory.cpp /tmp/ge-exec-before.o -Wl,--gc-sections -pthread -o /tmp/ge-state-before
+          if /tmp/ge-state-before > android/test-results/ge-matrix-before.txt; then echo "Old executor unexpectedly passed"; exit 1; fi
+          if /tmp/ge-state-before palette > android/test-results/ge-palette-before.txt; then echo "Old executor unexpectedly passed"; exit 1; fi
       - name: Install graphics test dependencies
         run: |
           sudo apt-get update -qq
@@ -90,22 +110,23 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -u
-          git add lcs/host/lcs_android_build.cpp lcs/host/lcs_android_build.hpp android/REPAIR_0611.md android/tests/lighting_cache_regression.cpp android/tests/reference_fragments.cpp android/tests/verify_apk.py
+          git add android/tools/repair_0612.patch lcs/host/lcs_ge_vertex_memo.hpp lcs/host/lcs_ge_triangle_indices.hpp android/tests/ge_command_state_regression.cpp android/tests/vertex_memo_regression.cpp android/tests/scale_config_regression.py
+          git add lcs/host/lcs_android_build.cpp lcs/host/lcs_android_build.hpp android/REPAIR_0612.md android/tests/lighting_cache_regression.cpp android/tests/reference_fragments.cpp android/tests/verify_apk.py
           if ! git diff --cached --quiet; then
-            git commit -m "Apply tested Android 0.6.11 exact blend, lighting cache and native identity fixes [skip ci]"
+            git commit -m "Apply tested Android 0.6.12 texture matrix, CLUT snapshots, batching and selectable 2x [skip ci]"
             git push origin HEAD:android-port
           fi
       - name: Record exact source
         run: |
           git rev-parse HEAD > android/test-results/source-commit.txt
-          git archive --format=tar.gz -o /tmp/LCSRecomp-Android-0.6.11-source.tar.gz HEAD
+          git archive --format=tar.gz -o /tmp/LCSRecomp-Android-0.6.12-source.tar.gz HEAD
           git -C android/.deps/ffmpeg-source archive --prefix=FFmpeg-7.1.5/ --format=tar.gz -o /tmp/LCS-FFmpeg-7.1.5-source.tar.gz HEAD
       - name: Upload source and tests
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.11-source-and-tests
+          name: LCSRecomp-Android-0.6.12-source-and-tests
           path: |
-            /tmp/LCSRecomp-Android-0.6.11-source.tar.gz
+            /tmp/LCSRecomp-Android-0.6.12-source.tar.gz
             /tmp/LCS-FFmpeg-7.1.5-source.tar.gz
             android/test-results/
       - name: Java 17
@@ -167,7 +188,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.11-arm64-debug
+          name: LCSRecomp-Android-0.6.12-arm64-debug
           path: |
             android/app/build/outputs/apk/debug/app-debug.apk
             android/app/build/outputs/apk/debug/app-debug.apk.sha256
@@ -177,5 +198,5 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.11-failed-test-results
+          name: LCSRecomp-Android-0.6.12-failed-test-results
           path: android/test-results/
