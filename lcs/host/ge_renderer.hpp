@@ -85,6 +85,9 @@ struct GeRenderStats {
     std::uint32_t next_index_address{};
 };
 
+void record_ge_bbox_result(bool visible) noexcept;
+void record_ge_bbox_jump() noexcept;
+std::array<std::uint64_t,4> take_ge_cull_counters() noexcept;
 bool test_ge_bounding_box(const psprecomp::GuestMemory &memory,
                           const std::array<std::uint32_t, 256> &commands,
                           const GeTransformState &transform,

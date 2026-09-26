@@ -17,6 +17,10 @@ enum class GeGpuBackendKind : std::uint8_t {
 };
 
 struct GeGpuDrawDescriptor {
+    // PSP colour targets may share one independent depth buffer.
+    bool depthbuffer_defined{};
+    std::uint32_t depthbuffer_address{};
+    std::uint32_t depthbuffer_stride{};
     std::uint32_t primitive{};
     std::uint32_t vertex_count{};
     std::uint32_t vertex_type{};

@@ -26,6 +26,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <memory>
 #include <span>
 #include <string>
 #include <thread>
@@ -66,6 +67,22 @@ struct GlesTexture {
     std::uint64_t byte_size{};
 };
 
+struct GlesDepth {
+    GLuint id{};
+    bool initialized{};
+    ~GlesDepth() { if (id) glDeleteRenderbuffers(1, &id); }
+};
+struct GlesDepthKey {
+    std::uint32_t address{}, stride{}, width{}, height{};
+    bool legacy{};
+    bool operator==(const GlesDepthKey &) const = default;
+};
+struct GlesDepthHash {
+    std::size_t operator()(const GlesDepthKey &k) const noexcept {
+        return k.address ^ (std::size_t(k.stride)<<21u) ^
+            (std::size_t(k.width)<<35u) ^ (std::size_t(k.height)<<47u) ^ k.legacy;
+    }
+};
 struct GlesTarget {
     std::uint32_t address{};
     std::uint32_t logical_width{kReferenceWidth};
@@ -74,6 +91,8 @@ struct GlesTarget {
     std::uint32_t render_height{};
     GLuint color{};
     GLuint depth{};
+    std::shared_ptr<GlesDepth> shared_depth;
+    GlesDepthKey bound_depth_key{};
     GLuint fbo{};
     GLuint feedback{};
     GLuint blend_copy{};
@@ -188,6 +207,10 @@ struct GlesState {
     std::uint64_t texture_cache_byte_limit{256ull * 1024ull * 1024ull};
     std::unordered_map<std::uint32_t, GlesTarget> targets;
     std::vector<GlesBatch> batches;
+    std::unordered_map<GlesDepthKey,std::shared_ptr<GlesDepth>,GlesDepthHash> depths;
+    std::vector<GlesBatch> batch_pool;
+    std::size_t batch_pool_bytes{};
+    std::uint64_t batch_reuses{}, depth_reuses{};
     std::vector<std::byte> last_texture_rgba;
 
     std::uint32_t display_framebuffer{};
@@ -286,7 +309,8 @@ void delete_target(GlesTarget &target) noexcept {
     if (target.feedback != 0u) glDeleteTextures(1, &target.feedback);
     if (target.blend_copy != 0u) glDeleteTextures(1, &target.blend_copy);
     if (target.fbo != 0u) glDeleteFramebuffers(1, &target.fbo);
-    if (target.depth != 0u) glDeleteRenderbuffers(1, &target.depth);
+    if (target.depth != 0u && !target.shared_depth) glDeleteRenderbuffers(1, &target.depth);
+    target.shared_depth.reset();
     if (target.color != 0u) glDeleteTextures(1, &target.color);
     target.feedback = 0u;
     target.blend_copy = 0u;
@@ -318,6 +342,8 @@ void destroy_gl_objects(GlesState &s) noexcept {
         delete_target(target);
     }
     s.targets.clear();
+    s.depths.clear();
+    s.batch_pool.clear(); s.batch_pool_bytes=0;
     for (auto &slot:s.geometry_slots) {
         if (slot.fence) glDeleteSync(slot.fence);
         if (slot.vertices) glDeleteBuffers(1,&slot.vertices);
@@ -945,6 +971,56 @@ GlesTarget &target_metadata(GlesState &s, std::uint32_t address) {
     return it->second;
 }
 
+GlesBatch take_batch(GlesState &s) {
+    GlesBatch out{};
+    if (s.batch_pool.empty()) return out;
+    auto &old=s.batch_pool.back();
+    s.batch_pool_bytes-=old.vertices.capacity()*sizeof(GeGpuVertex)+old.indices.capacity()*sizeof(std::uint32_t);
+    out.vertices.swap(old.vertices);out.indices.swap(old.indices);
+    out.vertices.clear();out.indices.clear();s.batch_pool.pop_back();++s.batch_reuses;
+    return out;
+}
+void recycle_batches(GlesState &s) {
+    constexpr std::size_t limit=16u*1024u*1024u;
+    for (auto &b:s.batches) {
+        const auto size=b.vertices.capacity()*sizeof(GeGpuVertex)+b.indices.capacity()*sizeof(std::uint32_t);
+        if (size && size<=limit && s.batch_pool_bytes<=limit-size && s.batch_pool.size()<2048u) {
+            try {
+                GlesBatch spare{};spare.vertices.swap(b.vertices);spare.indices.swap(b.indices);
+                s.batch_pool.push_back(std::move(spare));s.batch_pool_bytes+=size;
+            } catch (...) { /* Pooling is optional under memory pressure. */ }
+        }
+    }
+    s.batches.clear();
+}
+bool bind_target_depth(GlesState &s, GlesTarget &target, const GeGpuDrawDescriptor &draw,
+                       std::string &error) {
+    if (!draw.depthbuffer_defined) return true;
+    GlesDepthKey key{draw.depthbuffer_defined ? (draw.depthbuffer_address&0x001FFFF0u):target.address,
+        draw.depthbuffer_defined ? draw.depthbuffer_stride:draw.framebuffer_stride,
+        target.render_width,target.render_height,!draw.depthbuffer_defined};
+    if (target.shared_depth && target.bound_depth_key==key) return true;
+    auto &depth=s.depths[key];
+    if (!depth) {
+        depth=std::make_shared<GlesDepth>();
+        glGenRenderbuffers(1,&depth->id);
+        glBindRenderbuffer(GL_RENDERBUFFER,depth->id);
+        glRenderbufferStorage(GL_RENDERBUFFER,GL_DEPTH_COMPONENT24,key.width,key.height);
+
+    } else if (depth!=target.shared_depth) ++s.depth_reuses;
+    if (depth!=target.shared_depth) {
+        if (target.depth && !target.shared_depth) glDeleteRenderbuffers(1,&target.depth);
+        target.shared_depth=depth;target.depth=depth->id;target.bound_depth_key=key;
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_RENDERBUFFER,target.depth);
+        if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){error="Shared PSP depth attachment incomplete";return false;}
+    }
+    if (!depth->initialized) {
+        glDisable(GL_SCISSOR_TEST);glDepthMask(GL_TRUE);glClearDepthf(0.0f);
+        glClear(GL_DEPTH_BUFFER_BIT);depth->initialized=true;
+    }
+    return true;
+}
+
 bool ensure_target(GlesState &s, GlesTarget &target, std::string &error) {
     const std::uint32_t logical_width = std::max<std::uint32_t>(1u, target.logical_width);
     const std::uint32_t logical_height = std::max<std::uint32_t>(1u, target.logical_height);
@@ -1363,6 +1439,7 @@ bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
     if (!ensure_target(s, target, error)) return false;
 
     glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
+    if (!bind_target_depth(s,target,batch.draw,error)) return false;
     glViewport(0, 0,
                static_cast<GLsizei>(target.render_width),
                static_cast<GLsizei>(target.render_height));
@@ -1373,7 +1450,8 @@ bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
         glDepthMask(GL_TRUE);
         glClearColor(0.f, 0.f, 0.f, 1.f);
         glClearDepthf(0.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        // Shared depth must not be erased merely because a second colour target appears.
+        glClear(GL_COLOR_BUFFER_BIT | (batch.draw.depthbuffer_defined ? 0u : GL_DEPTH_BUFFER_BIT));
         target.cleared = true;
     }
 
@@ -1958,6 +2036,8 @@ bool gles_draw_state_compatible(
         a.color_test_function != b.color_test_function ||
         a.color_test_reference != b.color_test_reference ||
         a.color_test_mask != b.color_test_mask) return false;
+    if (a.depthbuffer_defined!=b.depthbuffer_defined || a.depthbuffer_address!=b.depthbuffer_address ||
+        a.depthbuffer_stride!=b.depthbuffer_stride) return false;
     if (a.texture_enabled != b.texture_enabled) return false;
     if (a.texture_enabled) {
         if (texture_lookup_key(a) != texture_lookup_key(b)) return false;
@@ -2029,6 +2109,7 @@ bool ge_gpu_backend_accumulate_clip_vertices(const GeGpuDrawDescriptor &input_dr
             last.vertices.size()+vertices.size()<=1048576u) destination=&last;
     }
     try {
+        if (destination==&fresh) fresh=take_batch(s);
         const std::uint32_t base=static_cast<std::uint32_t>(destination->vertices.size());
         const auto count=static_cast<std::uint32_t>(vertices.size());
         const std::size_t indices=primitive==3u ? (count/3u)*3u : (count-2u)*3u;
@@ -2092,7 +2173,7 @@ bool append_or_merge_color_batch(
     }
 
     try {
-        GlesBatch batch{};
+        GlesBatch batch=take_batch(s);
         batch.draw = draw;
         append_vertices(batch.vertices);
         s.batches.push_back(std::move(batch));
@@ -2120,7 +2201,7 @@ void ge_gpu_backend_accumulate_hardware_triangles(
     GlesState &s = state();
     if (!s.enabled || vertices.empty()) return;
     try {
-        GlesBatch batch{};
+        GlesBatch batch=take_batch(s);
         batch.draw = draw;
         batch.hardware_transform = true;
         batch.transform = transform;
@@ -2335,6 +2416,10 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
             " geomAllocations="+std::to_string(s.geometry_allocations)+
             " blendFetch="+std::to_string(s.framebuffer_fetch_enabled ? 1 : 0)+
             " blendFallbacks="+std::to_string(s.perf_blend_fallbacks)+
+            " depthBuffers="+std::to_string(s.depths.size())+
+            " depthReuses="+std::to_string(s.depth_reuses)+
+            " batchReuses="+std::to_string(s.batch_reuses)+
+            " batchPoolMB="+std::to_string(s.batch_pool_bytes/(1024u*1024u))+
             " missingTextures="+std::to_string(s.perf_missing_textures)+
             " blends="+std::to_string(s.perf_blend_equations[0])+","+
                 std::to_string(s.perf_blend_equations[1])+","+
@@ -2401,7 +2486,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
         ? "OpenGL ES 3 native GE active"
         : (!error.empty() ? error : "OpenGL ES GE frame not ready");
 
-    s.batches.clear();
+    recycle_batches(s);
 
     // All draw batches for this frame are now complete, so old cache entries
     // can be evicted safely if the configured memory/entry budget was exceeded.

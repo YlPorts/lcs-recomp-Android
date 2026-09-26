@@ -20,12 +20,15 @@ struct AndroidChannel {
     std::uint32_t rate{};
     bool stereo{};
     bool active{};
+    std::uint64_t produced{}, rebases{};
+    std::atomic<std::uint64_t> mixed{0}, empty_frames{0};
 };
 struct AndroidSound {
     std::mutex producer;
     AAudioStream *stream{};
     std::array<AndroidChannel,kAndroidChannels> channels;
     std::atomic<std::uint64_t> clock{0};
+    std::atomic<std::uint64_t> submit_horizon{0};
     std::atomic<std::uint64_t> late{0};
     std::atomic<std::uint64_t> silent_frames{0};
     std::atomic<int> error{0};
@@ -51,14 +54,21 @@ aaudio_data_callback_result_t android_audio_callback(
     auto *out=static_cast<std::int16_t*>(buffer);
     if (!out || count<=0) return AAUDIO_CALLBACK_RESULT_CONTINUE;
     auto first=s.clock.load(std::memory_order_relaxed);
+    // Reserve the callback's whole output range before it starts mixing.
+    // Producers may only schedule new packets beyond this horizon.
+    s.submit_horizon.store(first+static_cast<std::uint64_t>(count),std::memory_order_release);
     for (int32_t base=0; base<count; base+=256) {
         const auto n=static_cast<std::size_t>(std::min<int32_t>(256,count-base));
         std::array<std::int32_t,512> mixed{};
         std::uint64_t late=0, contributed=0, invalidated=0;
-        for (auto &c:s.channels)
-            contributed += c.queue.mix(std::span<std::int32_t>(mixed.data(),n*2),
+        for (auto &c:s.channels) {
+            const auto mixed_count=c.queue.mix(std::span<std::int32_t>(mixed.data(),n*2),
                 first+static_cast<std::uint64_t>(base),
                 c.generation.load(std::memory_order_acquire),late, &invalidated);
+            c.mixed.fetch_add(mixed_count,std::memory_order_relaxed);
+            c.empty_frames.fetch_add(n-mixed_count,std::memory_order_relaxed);
+            contributed+=mixed_count;
+        }
         s.late.fetch_add(late,std::memory_order_relaxed);
         s.mixed_samples.fetch_add(contributed,std::memory_order_relaxed);
         s.invalidated_samples.fetch_add(invalidated,std::memory_order_relaxed);
@@ -76,9 +86,10 @@ void android_audio_error(AAudioStream *,void *opaque,aaudio_result_t error) {
 void reset_audio_stopped(AndroidSound &s) {
     for (auto &c:s.channels) {
         c.queue.reset_stopped(); c.active=false;
+        c.produced=c.rebases=0; c.mixed.store(0); c.empty_frames.store(0);
         c.generation.fetch_add(1,std::memory_order_release);
     }
-    s.clock.store(0); s.late.store(0); s.silent_frames.store(0);
+    s.clock.store(0); s.submit_horizon.store(0); s.late.store(0); s.silent_frames.store(0);
     s.anchored=false; s.produced=s.dropped=s.resyncs=s.starvation_rebases=0;
     s.mixed_samples.store(0); s.invalidated_samples.store(0);
 }
@@ -129,7 +140,7 @@ void audio_output_submit(std::span<const std::int16_t> pcm,std::uint32_t frames,
     // This mutex serializes HLE producers only; the callback never acquires it.
     std::lock_guard<std::mutex> lock(s.producer);
     if (!open_android_audio(s)) return;
-    const auto read=s.clock.load(std::memory_order_acquire);
+    const auto read=s.submit_horizon.load(std::memory_order_acquire);
     const auto guest=sample_time(start_time_us);
     if (!s.anchored) {
         s.guest_anchor=sample_time(std::min(start_time_us,now_us));
@@ -156,12 +167,13 @@ void audio_output_submit(std::span<const std::int16_t> pcm,std::uint32_t frames,
             c.resampler.reset(rate,stereo);
             c.rate=rate; c.stereo=stereo;
         }
-        constexpr std::uint64_t callback_safety=512;
-        if (c.cursor<read+callback_safety) {
-            // Recover a real underrun without cancelling pending packets or
-            // restarting another full 93ms silent prebuffer.
-            c.cursor=read+callback_safety;
-            ++s.starvation_rebases;
+        if (c.cursor<read) {
+            // A nearly empty but still continuous queue is NOT an underrun.
+            // The old read+512 test inserted artificial gaps while samples
+            // were still queued. Reserve one small callback quantum only after
+            // a genuinely missed deadline, without discarding queued samples.
+            c.cursor=read+128u;
+            ++s.starvation_rebases; ++c.rebases;
         }
     }
     c.expected_guest=guest+(static_cast<std::uint64_t>(frames)*kAndroidRate+rate/2)/rate;
@@ -169,7 +181,7 @@ void audio_output_submit(std::span<const std::int16_t> pcm,std::uint32_t frames,
     packet.start=c.cursor; packet.generation=c.generation.load(std::memory_order_relaxed);
     const auto publish=[&]() {
         if (!packet.frames) return;
-        if (c.queue.push(packet)) s.produced+=packet.frames;
+        if (c.queue.push(packet)) { s.produced+=packet.frames; c.produced+=packet.frames; }
         else s.dropped+=packet.frames;
         packet.frames=0; packet.start=c.cursor;
     };
@@ -190,6 +202,13 @@ void audio_output_advance(std::uint64_t) {
     const auto now=std::chrono::steady_clock::now();
     if (!s.stream || now-s.last_log<std::chrono::seconds(2)) return;
     s.last_log=now;
+    std::string per_channel;
+    for (unsigned i=0;i<s.channels.size();++i) {
+        const auto &c=s.channels[i];
+        if (c.produced) per_channel += " ch"+std::to_string(i)+"="+std::to_string(c.produced)+
+            "/"+std::to_string(c.mixed.load())+"/"+std::to_string(c.rebases);
+    }
+    runtime_log_line("audioChannels: produced/mixed/deadlineMisses"+per_channel);
     runtime_log_line("audio: produced="+std::to_string(s.produced)+
         " lateSamples="+std::to_string(s.late.load())+
         " dropped="+std::to_string(s.dropped)+" resyncs="+std::to_string(s.resyncs)+

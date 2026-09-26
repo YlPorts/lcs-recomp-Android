@@ -2139,6 +2139,8 @@ void android_pipeline_report() {
         <<" vertexStatesReused="<<(phase.vertex_states_reused-previous.vertex_states_reused)
         <<" clutNoopLoads="<<(phase.clut_noops-previous.clut_noops)
         <<" paletteKeyHits="<<(phase.palette_key_hits-previous.palette_key_hits);
+    const auto cull=take_ge_cull_counters();
+    report<<" bboxTests="<<cull[0]<<" bboxOutside="<<cull[1]<<" bboxJumps="<<cull[2]<<" trivialRejects="<<cull[3];
     runtime_log_line(report.str());
     previous=phase;before_ge=ge;before_gpu=gpu;before_wait=wait;frames=0;started=now;
 }

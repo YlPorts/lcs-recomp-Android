@@ -151,6 +151,7 @@ std::uint64_t g_ge_primitive_count{};
 std::uint64_t g_ge_vertex_count{};
 std::uint64_t g_ge_memo_hits{};
 std::uint64_t g_ge_clut_loads{};
+std::uint64_t g_bbox_tests{}, g_bbox_outside{}, g_bbox_jumps{}, g_trivial_rejects{};
 std::uint64_t g_ge_vertex_states_reused{}, g_ge_clut_noops{}, g_ge_palette_key_hits{};
 std::uint64_t g_ge_texture_matrix_words{};
 std::uint64_t g_ge_palette_draws{};
@@ -3934,6 +3935,14 @@ void scale_hud_vertices(std::vector<Vertex> &vertices, std::uint32_t primitive,
 
 }
 
+void record_ge_bbox_result(bool visible) noexcept { ++g_bbox_tests; if (!visible) ++g_bbox_outside; }
+void record_ge_bbox_jump() noexcept { ++g_bbox_jumps; }
+std::array<std::uint64_t,4> take_ge_cull_counters() noexcept {
+    auto out = std::array<std::uint64_t,4>{g_bbox_tests,g_bbox_outside,g_bbox_jumps,g_trivial_rejects};
+    g_bbox_tests=g_bbox_outside=g_bbox_jumps=g_trivial_rejects=0;
+    return out;
+}
+
 bool test_ge_bounding_box(const psprecomp::GuestMemory &memory,
                           const std::array<std::uint32_t, 256> &commands,
                           const GeTransformState &transform,
@@ -3958,19 +3967,30 @@ bool test_ge_bounding_box(const psprecomp::GuestMemory &memory,
         return false;
     }
 
+    if (count > 256u || layout.through) { result.visible = true; return true; }
     const bool depth_clip_enabled = (data24(commands[0x1Cu]) & 1u) != 0u;
     const std::uint32_t plane_count = depth_clip_enabled ? 6u : 4u;
     std::array<bool, 6> all_outside{};
     all_outside.fill(true);
 
     bool through_visible = false;
+    auto bounds_commands = commands;
+    bounds_commands[0x17u] = 0u; bounds_commands[0x1Fu] = 0u;
+    bounds_commands[0xC0u] = 0u;
     const IndexStreamReader bbox_indices =
         make_index_reader(memory, index_address, layout.index_type, count);
     for (std::uint32_t element = 0u; element < count; ++element) {
         const std::uint32_t index = bbox_indices(element);
         Vertex vertex{};
-        if (!decode_vertex(memory, vertex_address + index * layout.stride, layout,
-                           commands, transform, vertex, error)) return false;
+        const std::uint64_t address = std::uint64_t(vertex_address) + std::uint64_t(index) * layout.stride;
+        if (address > 0xFFFFFFFFull) { error="GE bounding vertex address overflow"; return false; }
+        if (!decode_vertex(memory, static_cast<std::uint32_t>(address), layout,
+                           bounds_commands, transform, vertex, error)) return false;
+        if (!std::isfinite(vertex.x+vertex.y+vertex.z+vertex.w)) { result.visible=true; return true; }
+#if defined(__ANDROID__)
+        // The test must match the actual widened camera, not the narrower PSP view.
+        vertex.x *= android_ultrawide_x_scale();
+#endif
 
         if (layout.through) {
             const std::uint32_t region1 = data24(commands[0x15u]);
@@ -4108,6 +4128,9 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             gpu_draw.depth_test_enabled = (data24(commands[0x23u]) & 1u) != 0u;
             gpu_draw.depth_write_enabled = (data24(commands[0xE7u]) & 1u) == 0u;
             gpu_draw.depth_function = data24(commands[0xDEu]) & 7u;
+            gpu_draw.depthbuffer_defined = true;
+            gpu_draw.depthbuffer_address = depthbuffer_address(commands);
+            gpu_draw.depthbuffer_stride = data24(commands[0x9Fu]) & 0x7FCu;
             gpu_draw.fog_enabled = (data24(commands[0x1Fu]) & 1u) != 0u;
             gpu_draw.fog_color = data24(commands[0xCFu]) & 0x00FFFFFFu;
             gpu_draw.fog_end = decode_float24(data24(commands[0xCDu]));
@@ -4704,6 +4727,9 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
 #if defined(__ANDROID__)
         const float primitive_x_scale = layout.through ? 1.0f : android_ultrawide_x_scale();
 #endif
+        const std::uint64_t stream_bytes = std::uint64_t(count) * layout.stride;
+        const std::uint8_t *stream_raw = layout.index_type==0u && stream_bytes<=SIZE_MAX
+            ? memory.raw_pointer(vertex_address, static_cast<std::size_t>(stream_bytes)) : nullptr;
         for (std::uint32_t i = 0u; i < count; ++i) {
             const std::uint32_t index = draw_indices(i);
             const auto slot = index & 255u;
@@ -4718,8 +4744,9 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             const std::uint64_t source_address = static_cast<std::uint64_t>(vertex_address) +
                 static_cast<std::uint64_t>(index) * layout.stride;
             if (source_address > 0xFFFFFFFFull) { error = "GE vertex address overflow"; return false; }
-            const std::uint8_t *record = memory.raw_pointer(
-                static_cast<std::uint32_t>(source_address), layout.stride);
+            const std::uint8_t *record = stream_raw
+                ? stream_raw + static_cast<std::size_t>(index) * layout.stride
+                : memory.raw_pointer(static_cast<std::uint32_t>(source_address), layout.stride);
             if (record == nullptr) { error = "GE vertex record outside guest memory"; return false; }
             const VertexByteView record_view{record, layout.stride};
             const auto decode = [&](Vertex &out) {
@@ -4820,6 +4847,21 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             gpu_draw.scissor_x1 = setup.scissor_x1;
             gpu_draw.widescreen_hud = true;
         }
+    }
+
+    if (gpu_only_triangle_path && !layout.through && !setup.clear_mode &&
+        primitive>=3u && primitive<=5u && !vertices.empty()) {
+        unsigned common_outside = 0x3Fu;
+        const bool zclip = (data24(commands[0x1Cu]) & 1u)!=0u;
+        for (const auto &v : vertices) {
+            if (!(v.w>0.0f) || !std::isfinite(v.x+v.y+v.z+v.w)) { common_outside=0u; break; }
+            unsigned out = (v.x < -v.w ? 1u:0u) | (v.x > v.w ? 2u:0u) |
+                           (v.y < -v.w ? 4u:0u) | (v.y > v.w ? 8u:0u);
+            if (zclip) out |= (v.z < -v.w ? 16u:0u) | (v.z > v.w ? 32u:0u);
+            common_outside &= out;
+            if (!common_outside) break;
+        }
+        if (common_outside) { ++g_trivial_rejects; advance_stream(); return true; }
     }
 
     if (legacy_vertex_staging_enabled() && gpu_backend_enabled &&
