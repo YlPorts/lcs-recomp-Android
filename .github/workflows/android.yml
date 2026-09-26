@@ -12,6 +12,10 @@ on:
 permissions:
   contents: write
 
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: lcs-android-${{ github.ref }}
   cancel-in-progress: true
@@ -27,9 +31,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          fetch-depth: 3
-      - name: Apply checked 0.6.12 source update
-        run: python3 android/tools/repair_0612.py
+          fetch-depth: 0
+      - name: Apply checked 0.6.13 source update
+        run: python3 android/tools/repair_0613.py
       - name: Component and audio regression tests
         run: |
           mkdir -p android/test-results
@@ -71,6 +75,21 @@ jobs:
           g++ -std=c++20 -O2 -ffunction-sections -fdata-sections -Iinclude -Ilcs/host android/tests/ge_command_state_regression.cpp src/guest_memory.cpp /tmp/ge-exec-before.o -Wl,--gc-sections -pthread -o /tmp/ge-state-before
           if /tmp/ge-state-before > android/test-results/ge-matrix-before.txt; then echo "Old executor unexpectedly passed"; exit 1; fi
           if /tmp/ge-state-before palette > android/test-results/ge-palette-before.txt; then echo "Old executor unexpectedly passed"; exit 1; fi
+      - name: Texture LOD palette and cross-draw regression tests
+        run: |
+          set -euo pipefail
+          for mode in optimized sanitized; do
+            FLAGS="-std=c++20 -O2 -ffunction-sections -fdata-sections -Iinclude -Ilcs/host"
+            if [ "$mode" = sanitized ]; then FLAGS="-std=c++20 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -ffunction-sections -fdata-sections -Iinclude -Ilcs/host"; fi
+            for test in texture_state_0613 vertex_state_0613; do
+              g++ $FLAGS android/tests/$test.cpp src/guest_memory.cpp -Wl,--gc-sections -pthread -o /tmp/$test-$mode
+              /tmp/$test-$mode | tee android/test-results/$test-$mode.txt
+            done
+          done
+          git show e5e48f760c7ec3b73a1d7a1055b9d7a3f9128a0a:lcs/host/ge_renderer.cpp > /tmp/ge-renderer-before.cpp
+          g++ -std=c++20 -O2 -ffunction-sections -fdata-sections -Iinclude -Ilcs/host '-DLCS_TEST_RENDERER="/tmp/ge-renderer-before.cpp"' android/tests/texture_state_0613.cpp src/guest_memory.cpp -Wl,--gc-sections -pthread -o /tmp/texture-before
+          if /tmp/texture-before > android/test-results/mip-palette-before.txt; then echo "Old mip reader unexpectedly passed"; exit 1; fi
+          if /tmp/texture-before hash > android/test-results/texture-hash-before.txt; then echo "Old sampled hash unexpectedly passed"; exit 1; fi
       - name: Install graphics test dependencies
         run: |
           sudo apt-get update -qq
@@ -110,23 +129,24 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -u
-          git add android/tools/repair_0612.patch lcs/host/lcs_ge_vertex_memo.hpp lcs/host/lcs_ge_triangle_indices.hpp android/tests/ge_command_state_regression.cpp android/tests/vertex_memo_regression.cpp android/tests/scale_config_regression.py
-          git add lcs/host/lcs_android_build.cpp lcs/host/lcs_android_build.hpp android/REPAIR_0612.md android/tests/lighting_cache_regression.cpp android/tests/reference_fragments.cpp android/tests/verify_apk.py
+          git add lcs/host/lcs_ge_state_policy.hpp android/tests/texture_state_0613.cpp android/tests/vertex_state_0613.cpp
+          git add android/tools/repair_0613.patch lcs/host/lcs_ge_vertex_memo.hpp lcs/host/lcs_ge_triangle_indices.hpp android/tests/ge_command_state_regression.cpp android/tests/vertex_memo_regression.cpp android/tests/scale_config_regression.py
+          git add lcs/host/lcs_android_build.cpp lcs/host/lcs_android_build.hpp android/REPAIR_0613.md android/tests/lighting_cache_regression.cpp android/tests/reference_fragments.cpp android/tests/verify_apk.py
           if ! git diff --cached --quiet; then
-            git commit -m "Apply tested Android 0.6.12 texture matrix, CLUT snapshots, batching and selectable 2x [skip ci]"
+            git commit -m "Apply tested Android 0.6.13 mip palette/LOD, bounded geometry buffers and exact state reuse [skip ci]"
             git push origin HEAD:android-port
           fi
       - name: Record exact source
         run: |
           git rev-parse HEAD > android/test-results/source-commit.txt
-          git archive --format=tar.gz -o /tmp/LCSRecomp-Android-0.6.12-source.tar.gz HEAD
+          git archive --format=tar.gz -o /tmp/LCSRecomp-Android-0.6.13-source.tar.gz HEAD
           git -C android/.deps/ffmpeg-source archive --prefix=FFmpeg-7.1.5/ --format=tar.gz -o /tmp/LCS-FFmpeg-7.1.5-source.tar.gz HEAD
       - name: Upload source and tests
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.12-source-and-tests
+          name: LCSRecomp-Android-0.6.13-source-and-tests
           path: |
-            /tmp/LCSRecomp-Android-0.6.12-source.tar.gz
+            /tmp/LCSRecomp-Android-0.6.13-source.tar.gz
             /tmp/LCS-FFmpeg-7.1.5-source.tar.gz
             android/test-results/
       - name: Java 17
@@ -188,7 +208,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.12-arm64-debug
+          name: LCSRecomp-Android-0.6.13-arm64-debug
           path: |
             android/app/build/outputs/apk/debug/app-debug.apk
             android/app/build/outputs/apk/debug/app-debug.apk.sha256
@@ -198,5 +218,5 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.12-failed-test-results
+          name: LCSRecomp-Android-0.6.13-failed-test-results
           path: android/test-results/
