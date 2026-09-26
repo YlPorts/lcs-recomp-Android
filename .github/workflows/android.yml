@@ -26,10 +26,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Apply checked source migrations
-        run: |
-          python3 android/tools/repair_068.py
-          python3 android/tools/repair_069.py
+      - name: Apply checked 0.6.10 source update
+        run: python3 android/tools/repair_0610.py
       - name: Component and audio regression tests
         run: |
           mkdir -p android/test-results
@@ -45,6 +43,10 @@ jobs:
         run: |
           g++ -std=c++20 -O2 -ffunction-sections -fdata-sections -Iinclude -Ilcs/host android/tests/cpu_geometry_regression.cpp src/guest_memory.cpp -Wl,--gc-sections -pthread -o /tmp/geometry
           /tmp/geometry | tee android/test-results/geometry.txt
+          g++ -std=c++20 -O2 -ffunction-sections -fdata-sections -Iinclude -Ilcs/host android/tests/vertex_bytes_regression.cpp src/guest_memory.cpp -Wl,--gc-sections -pthread -o /tmp/vertex-bytes
+          /tmp/vertex-bytes | tee android/test-results/vertex-bytes.txt
+          g++ -std=c++20 -O1 -g -fsanitize=address,undefined -ffunction-sections -fdata-sections -Iinclude -Ilcs/host android/tests/vertex_bytes_regression.cpp src/guest_memory.cpp -Wl,--gc-sections -pthread -o /tmp/vertex-bytes-san
+          /tmp/vertex-bytes-san | tee android/test-results/vertex-bytes-sanitized.txt
       - name: Install graphics test dependencies
         run: |
           sudo apt-get update -qq
@@ -67,27 +69,38 @@ jobs:
               path.write_text(source)
               subprocess.run(['glslangValidator','-S',stage,str(path)],check=True)
           PY
+      - name: Build and test actual ATRAC decoders
+        run: |
+          bash android/tools/build_ffmpeg.sh host
+          PREFIX="$PWD/android/.deps/ffmpeg-host"
+          curl --fail --location --retry 3 'https://samples.ffmpeg.org/A-codecs/ATRAC3/sample.ATRAC3.66kbps.44100Hz.Stereo.wav' -o /tmp/atrac3.wav
+          curl --fail --location --retry 3 'https://samples.ffmpeg.org/A-codecs/ATRAC3%2B/at3p_sample5.oma' -o /tmp/atrac3plus.oma
+          sha256sum /tmp/atrac3.wav /tmp/atrac3plus.oma > android/test-results/media-input-sha256.txt
+          g++ -std=c++20 -O2 -Ilcs/host -I"$PREFIX/include" android/tests/media_regression.cpp lcs/host/lcs_media_decoder.cpp -L"$PREFIX/lib" -Wl,-rpath,"$PREFIX/lib" -lavformat -lavcodec -lavutil -lswresample -lswscale -o /tmp/media
+          LD_LIBRARY_PATH="$PREFIX/lib" /tmp/media /tmp/atrac3.wav /tmp/atrac3plus.oma | tee android/test-results/atrac-codecs.txt
       - name: Commit tested readable source changes
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/android-port'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -u
-          git add android/REPAIR_069.md
+          git add android/app/src/main/assets/licenses/FFmpeg-LGPL-2.1.txt android/REPAIR_0610.md android/tests/vertex_bytes_regression.cpp android/tests/media_regression.cpp android/tools/build_ffmpeg.sh android/FFMPEG.md
           if ! git diff --cached --quiet; then
-            git commit -m "Apply tested Android 0.6.9 audio continuity, ordered frames and CPU preparation fixes [skip ci]"
+            git commit -m "Apply tested Android 0.6.10 clip-space submission and real ATRAC decoder [skip ci]"
             git push origin HEAD:android-port
           fi
       - name: Record exact source
         run: |
           git rev-parse HEAD > android/test-results/source-commit.txt
-          git archive --format=tar.gz -o /tmp/LCSRecomp-Android-0.6.9-source.tar.gz HEAD
+          git archive --format=tar.gz -o /tmp/LCSRecomp-Android-0.6.10-source.tar.gz HEAD
+          git -C android/.deps/ffmpeg-source archive --prefix=FFmpeg-7.1.5/ --format=tar.gz -o /tmp/LCS-FFmpeg-7.1.5-source.tar.gz HEAD
       - name: Upload source and tests
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.9-source-and-tests
+          name: LCSRecomp-Android-0.6.10-source-and-tests
           path: |
-            /tmp/LCSRecomp-Android-0.6.9-source.tar.gz
+            /tmp/LCSRecomp-Android-0.6.10-source.tar.gz
+            /tmp/LCS-FFmpeg-7.1.5-source.tar.gz
             android/test-results/
       - name: Java 17
         uses: actions/setup-java@v6
@@ -100,6 +113,20 @@ jobs:
           packages: ""
       - name: Install Android toolchain
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+      - name: Restore Android codec libraries
+        id: codecs
+        uses: actions/cache/restore@v5
+        with:
+          path: android/.deps/ffmpeg-android
+          key: lcs-ffmpeg-arm64-ndk27-${{ hashFiles('android/tools/build_ffmpeg.sh') }}
+      - name: Build FFmpeg ARM64 shared libraries
+        run: bash android/tools/build_ffmpeg.sh android
+      - name: Save Android codec libraries
+        if: steps.codecs.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: android/.deps/ffmpeg-android
+          key: ${{ steps.codecs.outputs.cache-primary-key }}
       - name: Gradle 8.10.2
         uses: gradle/actions/setup-gradle@v4
         with:
@@ -130,12 +157,12 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.9-arm64-debug
+          name: LCSRecomp-Android-0.6.10-arm64-debug
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
       - name: Upload test results on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.9-failed-test-results
+          name: LCSRecomp-Android-0.6.10-failed-test-results
           path: android/test-results/
