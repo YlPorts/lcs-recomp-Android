@@ -2,6 +2,7 @@
 #include "android_debug.hpp"
 #include "lcs_android_build.hpp"
 #include "ge_gpu_backend.hpp"
+#include "lcs_render_capture.hpp"
 #include "psprecomp/runtime.hpp"
 
 #include <android/native_window_jni.h>
@@ -215,7 +216,16 @@ Java_com_ylports_lcsrecomp_MainActivity_nativeRun(
     };
 
     const int result = lcs_android_entry(3, argv);
+    lcs::render_capture_incomplete(); // An exit can interrupt an explicitly requested frame.
+    lcs::render_capture_finish();
     lcs::android_debug::set_result(result);
     lcs::android_debug::set_stage(lcs::android_debug::Stage::Finished);
     return result;
 }
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_ylports_lcsrecomp_MainActivity_nativeCaptureFrame(JNIEnv *env,jclass,jstring path){
+    return lcs::render_capture_request(from_jstring(env,path))?JNI_TRUE:JNI_FALSE;
+}
+extern "C" JNIEXPORT jint JNICALL
+Java_com_ylports_lcsrecomp_MainActivity_nativeCaptureStatus(JNIEnv *,jclass){return lcs::render_capture_status();}

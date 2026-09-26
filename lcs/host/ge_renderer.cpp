@@ -1,4 +1,10 @@
 #include "ge_renderer.hpp"
+#if defined(__ANDROID__)
+#include "lcs_render_capture.hpp"
+#include "lcs_android_build.hpp"
+#endif
+#include <sstream>
+#include <unordered_set>
 #include "lcs_ge_state_policy.hpp"
 #include "lcs_ge_vertex_memo.hpp"
 #include "ge_gpu_backend.hpp"
@@ -1380,6 +1386,24 @@ public:
     }
 };
 
+struct PreparedEnvironmentMap {
+    Vec3 light_s{};
+    Vec3 light_t{};
+};
+
+PreparedEnvironmentMap prepare_environment_map(
+    const std::array<std::uint32_t, 256> &commands) noexcept {
+    const std::uint32_t shade = data24(commands[0xC1u]);
+    const auto light_vector = [&](std::uint32_t light) {
+        return normalized_or_001(Vec3{
+            decode_float24(data24(commands[0x63u + light * 3u])),
+            decode_float24(data24(commands[0x64u + light * 3u])),
+            decode_float24(data24(commands[0x65u + light * 3u])),
+        });
+    };
+    return {light_vector(shade & 3u), light_vector((shade >> 8u) & 3u)};
+}
+
 template <typename VertexMemory>
 bool decode_vertex(const VertexMemory &memory, std::uint32_t address,
                    const VertexLayout &layout,
@@ -1387,7 +1411,8 @@ bool decode_vertex(const VertexMemory &memory, std::uint32_t address,
                    const GeTransformState &transform,
                    Vertex &vertex, std::string &error,
                    const PreparedLighting *prepared = nullptr,
-                   VertexLightingCache *lighting_cache = nullptr) {
+                   VertexLightingCache *lighting_cache = nullptr,
+                   const PreparedEnvironmentMap *environment_map = nullptr) {
     if (!memory.contains(address, layout.stride)) {
         error = "GE vertex lies outside guest memory at " + psprecomp::hex32(address);
         return false;
@@ -1514,18 +1539,10 @@ bool decode_vertex(const VertexMemory &memory, std::uint32_t address,
         vertex.v = stq.y * texture_height;
         vertex.q = stq.z;
     } else if (uv_generation == 2u) {
-        const std::uint32_t shade = data24(commands[0xC1u]);
-        const std::uint32_t light_s = shade & 3u;
-        const std::uint32_t light_t = (shade >> 8u) & 3u;
-        auto light_vector = [&](std::uint32_t light) {
-            return normalized_or_001(Vec3{
-                decode_float24(data24(commands[0x63u + light * 3u])),
-                decode_float24(data24(commands[0x64u + light * 3u])),
-                decode_float24(data24(commands[0x65u + light * 3u])),
-            });
-        };
-        vertex.u = ((dot(light_vector(light_s), world_normal) + 1.0f) * 0.5f) * texture_width;
-        vertex.v = ((dot(light_vector(light_t), world_normal) + 1.0f) * 0.5f) * texture_height;
+        const PreparedEnvironmentMap prepared_environment = environment_map
+            ? *environment_map : prepare_environment_map(commands);
+        vertex.u = ((dot(prepared_environment.light_s, world_normal) + 1.0f) * 0.5f) * texture_width;
+        vertex.v = ((dot(prepared_environment.light_t, world_normal) + 1.0f) * 0.5f) * texture_height;
     } else if (layout.tc_type != 0u) {
         const float scale_u = decode_float24(data24(commands[0x48u]));
         const float scale_v = decode_float24(data24(commands[0x49u]));
@@ -1592,12 +1609,14 @@ bool decode_vertex_optimized(const VertexMemory &memory, std::uint32_t address,
                              const GeTransformState &transform,
                              Vertex &vertex, std::string &error,
                    const PreparedLighting *prepared = nullptr,
-                   VertexLightingCache *lighting_cache = nullptr) {
+                   VertexLightingCache *lighting_cache = nullptr,
+                   const PreparedEnvironmentMap *environment_map = nullptr) {
     const std::uint32_t uv_mode = data24(commands[0xC0u]) & 3u;
     if (layout.type == 0x000115u && !layout.through &&
         (data24(commands[0x17u]) & 1u) == 0u && (uv_mode == 0u || uv_mode == 3u))
         return decode_vertex_0115_fast(memory, address, layout, commands, transform, vertex, error);
-    return decode_vertex(memory, address, layout, commands, transform, vertex, error, prepared, lighting_cache);
+    return decode_vertex(memory, address, layout, commands, transform, vertex, error,
+                         prepared, lighting_cache, environment_map);
 }
 
 bool decode_model_vertex_0115_for_gpu_fast(
@@ -1927,8 +1946,8 @@ TextureSetup make_texture_setup_for_level(const psprecomp::GuestMemory &memory, 
     setup.clamp_u = (wrap & 1u) != 0u;
     setup.clamp_v = (wrap & 0x100u) != 0u;
     setup.format = data24(commands[0xC3u]) & 0xFu;
-    setup.buffer_width = std::max<std::uint32_t>(
-        1u, data24(commands[0xA8u + setup.selected_level]) & 0x7FFu);
+    setup.buffer_width = ge_texture_buffer_width(
+        data24(commands[0xA8u + setup.selected_level]), setup.format);
     setup.swizzled = (data24(commands[0xC2u]) & 1u) != 0u;
     setup.base = texture_address(commands, setup.selected_level);
     setup.linear = ((data24(commands[0xC6u]) >> 8u) & 1u) != 0u;
@@ -4023,6 +4042,97 @@ bool test_ge_bounding_box(const psprecomp::GuestMemory &memory,
     return true;
 }
 
+
+bool ge_position_only_outside(const psprecomp::GuestMemory &memory,
+    const std::array<std::uint32_t,256> &commands,const GeTransformState &transform,
+    const VertexLayout &layout,std::uint32_t va,std::uint32_t ia,std::uint32_t count,float x_scale) {
+    if(layout.through||layout.weight_type||layout.morph_count!=1||!count||
+       (data24(commands[0xD3u])&1u)||!std::isfinite(x_scale)||x_scale<=0)return false;
+    const bool zclip=(data24(commands[0x1Cu])&1u)!=0u;
+    unsigned common=zclip?63u:15u;
+    const auto isize=index_size(layout.index_type);
+    if(isize&&!memory.contains(ia,std::size_t(count)*isize))return false;
+    const auto indices=make_index_reader(memory,ia,layout.index_type,count);
+    for(std::uint32_t i=0;i<count;++i){
+        const std::uint64_t address=std::uint64_t(va)+std::uint64_t(indices(i))*layout.stride;
+        if(address>UINT32_MAX)return false;
+        const auto*raw=memory.raw_pointer(static_cast<std::uint32_t>(address),layout.stride);
+        if(!raw)return false;
+        const VertexByteView view{raw,layout.stride};
+        const auto model=read_vector3(view,layout.position_offset,layout.position_type);
+        const auto world=transform_4x3(transform.world,model);
+        const auto eye=transform_4x3(transform.view,world);
+        auto clip=transform_4x4(transform.projection,eye);clip.x*=x_scale;
+        if(!(clip.w>0)||!std::isfinite(clip.x+clip.y+clip.z+clip.w))return false;
+        unsigned mask=(clip.x < -clip.w?1u:0u)|(clip.x>clip.w?2u:0u)|
+                      (clip.y < -clip.w?4u:0u)|(clip.y>clip.w?8u:0u);
+        if(zclip)mask|=(clip.z < -clip.w?16u:0u)|(clip.z>clip.w?32u:0u);
+        common&=mask;if(!common)return false;
+    }
+    return common!=0;
+}
+
+#if defined(__ANDROID__)
+void capture_ge_primitive(const psprecomp::GuestMemory &memory,
+    const std::array<std::uint32_t,256> &commands,const GeTransformState &tr,
+    const VertexLayout &layout,std::uint32_t va,std::uint32_t ia,std::uint32_t prim){
+    if(!render_capture_active())return;
+    try{
+        const auto number=render_capture_next_draw();const auto prefix="draws/"+std::to_string(number);
+        static thread_local std::unordered_set<std::string>assets;
+        if(!number){assets.clear();render_capture_text("build.txt",android_build_identity());}
+        render_capture_bytes(prefix+".commands",std::as_bytes(std::span(commands)));
+        render_capture_bytes(prefix+".palette",std::as_bytes(std::span(tr.clut.data())));
+        // 156 float32 values: bones96, world12, view12, projection16, texture12, morph8.
+        std::vector<float>matrices;
+        for(auto a:{std::span<const float>(tr.bones),std::span<const float>(tr.world),std::span<const float>(tr.view),
+            std::span<const float>(tr.projection),std::span<const float>(tr.texture),std::span<const float>(tr.morph_weights)})
+            matrices.insert(matrices.end(),a.begin(),a.end());
+        render_capture_bytes(prefix+".matrices",std::as_bytes(std::span(matrices)));
+        const std::uint32_t count=prim&65535u,isize=index_size(layout.index_type);
+        std::ostringstream meta;meta<<"{\"primitive\":"<<prim<<",\"vertexAddress\":"<<va<<",\"indexAddress\":"<<ia
+            <<",\"stride\":"<<layout.stride<<",\"count\":"<<count;
+        std::uint32_t max_index=count?count-1:0;
+        if(isize){
+            if(memory.contains(ia,std::size_t(count)*isize)){
+                auto reader=make_index_reader(memory,ia,layout.index_type,count);max_index=0;
+                for(std::uint32_t i=0;i<count;++i)max_index=std::max(max_index,reader(i));
+                const auto*raw=memory.raw_pointer(ia,std::size_t(count)*isize);
+                if(raw)render_capture_bytes(prefix+".indices",std::as_bytes(std::span(raw,std::size_t(count)*isize)));
+                else render_capture_incomplete();
+            }else render_capture_incomplete();
+        }
+        const std::uint64_t bytes=(std::uint64_t(max_index)+1)*layout.stride;
+        const auto*records=bytes<=4u*1024u*1024u?memory.raw_pointer(va,std::size_t(bytes)):nullptr;
+        if(records)render_capture_bytes(prefix+".vertices",std::as_bytes(std::span(records,std::size_t(bytes))));
+        else render_capture_incomplete();
+        meta<<",\"textures\":[";
+        if((data24(commands[0x1Eu])&1u)!=0u){
+            const auto levels=(data24(commands[0xC6u])&4u)?std::min(8u,1u+((data24(commands[0xC2u])>>16)&7u)):1u;
+            for(unsigned level=0;level<levels;++level){
+                const auto t=make_texture_setup_for_level(memory,commands,level,&tr.clut);
+                const auto signature=texture_source_signature(memory,t);
+                const auto pal=ge_hash_all_bytes(tr.clut.data().data(),tr.clut.data().size());
+                const std::string name="textures/"+std::to_string(t.base)+"_"+std::to_string(signature)+"_"+
+                    std::to_string(pal)+"_"+std::to_string(commands[0xC5u])+"_"+std::to_string(t.format)+"_"+
+                    std::to_string(t.width)+"x"+std::to_string(t.height)+"_"+std::to_string(t.swizzled)+"_"+
+                    std::to_string(t.clut_bank)+"_"+std::to_string(t.buffer_width)+"_"+std::to_string(level);
+                if(level)meta<<',';
+                meta<<"{\"file\":\""<<name<<".rgba\",\"width\":"<<t.width<<",\"height\":"<<t.height
+                    <<",\"address\":"<<t.base<<",\"format\":"<<t.format<<",\"level\":"<<level<<"}";
+                const auto n=std::uint64_t(t.width)*t.height*4u;
+                if(n<=4u*1024u*1024u&&assets.insert(name).second){
+                    std::vector<std::byte>rgba(static_cast<std::size_t>(n));
+                    if(decode_texture_rgba_into(memory,t,rgba))render_capture_bytes(name+".rgba",rgba);
+                    else render_capture_incomplete();
+                }else if(n>4u*1024u*1024u)render_capture_incomplete();
+            }
+        }
+        meta<<"],\"cpuDecodedTextures\":true}\n";render_capture_text(prefix+".json",meta.str());
+    }catch(...){render_capture_incomplete();}
+}
+#endif
+
 bool render_ge_primitive(psprecomp::GuestMemory &memory,
                          const std::array<std::uint32_t, 256> &commands,
                          const GeTransformState &transform,
@@ -4071,7 +4181,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             gpu_draw.framebuffer_format = data24(commands[0xD2u]) & 3u;
             gpu_draw.texture_format = data24(commands[0xC3u]) & 0xFu;
             gpu_draw.texture_selected_level=selected_texture_level(commands);
-            for(std::uint32_t level=0;level<8;++level){gpu_draw.texture_level_addresses[level]=texture_address(commands,level);gpu_draw.texture_level_buffer_widths[level]=std::max<std::uint32_t>(1u,data24(commands[0xA8u+level])&0x7FFu);const auto sz=data24(commands[0xB8u+level]);gpu_draw.texture_level_widths[level]=1u<<(sz&0xFu);gpu_draw.texture_level_heights[level]=1u<<((sz>>8u)&0xFu);}
+            for(std::uint32_t level=0;level<8;++level){gpu_draw.texture_level_addresses[level]=texture_address(commands,level);gpu_draw.texture_level_buffer_widths[level]=ge_texture_buffer_width(data24(commands[0xA8u+level]),gpu_draw.texture_format);const auto sz=data24(commands[0xB8u+level]);gpu_draw.texture_level_widths[level]=1u<<(sz&0xFu);gpu_draw.texture_level_heights[level]=1u<<((sz>>8u)&0xFu);}
             gpu_draw.texture_address=gpu_draw.texture_level_addresses[0];gpu_draw.texture_buffer_width=gpu_draw.texture_level_buffer_widths[0];gpu_draw.texture_width=gpu_draw.texture_level_widths[0];gpu_draw.texture_height=gpu_draw.texture_level_heights[0];
             const std::uint32_t gpu_texfunc = data24(commands[0xC9u]);
             gpu_draw.texture_function = gpu_texfunc & 7u;
@@ -4241,6 +4351,19 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         if (collect_diagnostic_stats) stats.generated_uv_vertices += count;
 
     const bool gpu_only_triangle_path = gpu_backend_enabled && software_raster_skipped(commands);
+#if defined(__ANDROID__)
+    capture_ge_primitive(memory,commands,transform,layout,vertex_address,index_address,primitive_data);
+    static const bool early_positions=[] {
+        const char *v=std::getenv("PSPRECOMP_GE_EARLY_POSITION_CULL");
+        return !v||std::strcmp(v,"0")!=0;
+    }();
+    if(early_positions&&gpu_only_triangle_path&&primitive>=3u&&primitive<=5u&&!gpu_draw.clear_mode){
+        const float scale=android_ultrawide_x_scale();
+        if(ge_position_only_outside(memory,commands,transform,layout,vertex_address,index_address,count,scale)){
+            ++g_trivial_rejects;advance_stream();return true;
+        }
+    }
+#endif
 
     if (gpu_backend_enabled && gpu_draw.texture_enabled &&
         ge_gpu_backend_texture_needed(gpu_draw) &&
@@ -4730,6 +4853,12 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         const std::uint64_t stream_bytes = std::uint64_t(count) * layout.stride;
         const std::uint8_t *stream_raw = layout.index_type==0u && stream_bytes<=SIZE_MAX
             ? memory.raw_pointer(vertex_address, static_cast<std::size_t>(stream_bytes)) : nullptr;
+        // Environment-map light selection and vectors are constant for this
+        // primitive. Normalize them once; all per-vertex normal, lighting and
+        // dot-product arithmetic stays unchanged.
+        const bool environment_uv = !layout.through && uv_generation == 2u;
+        const PreparedEnvironmentMap primitive_environment = environment_uv
+            ? prepare_environment_map(commands) : PreparedEnvironmentMap{};
         for (std::uint32_t i = 0u; i < count; ++i) {
             const std::uint32_t index = draw_indices(i);
             const auto slot = index & 255u;
@@ -4751,7 +4880,8 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             const VertexByteView record_view{record, layout.stride};
             const auto decode = [&](Vertex &out) {
                 return decode_vertex_optimized(record_view, 0u, layout,
-                    commands, transform, out, error, &primitive_lighting, &primitive_light_cache);
+                    commands, transform, out, error, &primitive_lighting, &primitive_light_cache,
+                    environment_uv ? &primitive_environment : nullptr);
             };
             bool memo_hit=false;
             if (memo_enabled) {

@@ -1,6 +1,8 @@
 package com.ylports.lcsrecomp;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.widget.Toast;
 import android.app.ActivityManager;
 import android.app.ApplicationExitInfo;
 import android.content.Intent;
@@ -42,6 +44,7 @@ import java.util.List;
 public final class MainActivity extends Activity {
     private static final int REQUEST_GAME_ISO = 1001;
     private static final int REQUEST_EBOOT_ELF = 1002;
+    private static final int REQUEST_CAPTURE = 1003;
 
     static {
         System.loadLibrary("lcsrecomp");
@@ -56,6 +59,8 @@ public final class MainActivity extends Activity {
     static native void nativeRequestStop();
     static native String nativeGetDebugStatus();
     static native String nativeGetBuildInfo();
+    static native boolean nativeCaptureFrame(String path);
+    static native int nativeCaptureStatus();
 
     private TextView statusView;
     private Button playButton;
@@ -154,6 +159,11 @@ public final class MainActivity extends Activity {
             scaleButton.setText("Resolución interna: " + scale + "× (tocar para cambiar)");
         });
         root.addView(scaleButton);
+        Button exportCapture = new Button(this);
+        exportCapture.setText("Guardar captura de renderizado");
+        exportCapture.setEnabled(captureFile().isFile());
+        exportCapture.setOnClickListener(v -> chooseCaptureDestination());
+        root.addView(exportCapture);
         TextView scaleInfo = new TextView(this);
         scaleInfo.setText("2× dibuja 4 veces más píxeles. 1× prioriza velocidad. Se aplica al iniciar.");
         scaleInfo.setTextColor(Color.LTGRAY);
@@ -321,6 +331,10 @@ public final class MainActivity extends Activity {
         if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
 
         Uri uri = data.getData();
+        if (requestCode == REQUEST_CAPTURE) {
+            exportCapture(uri);
+            return;
+        }
         try {
             getContentResolver().takePersistableUriPermission(
                     uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
@@ -814,10 +828,86 @@ public final class MainActivity extends Activity {
         gameThread.start();
     }
 
+    private File captureFile() {
+        return new File(getFilesDir(), "render-capture.zip");
+    }
+
+    private final Runnable capturePoll = new Runnable() {
+        @Override public void run() {
+            if (destroyed) return;
+            int status = nativeCaptureStatus();
+            if (status == 1 || status == 2) {
+                debugHandler.postDelayed(this, 300);
+            } else if (status == 3 && captureFile().isFile()) {
+                Toast.makeText(MainActivity.this,
+                        "Captura lista. Vuelve al menú para guardar el ZIP.", Toast.LENGTH_LONG).show();
+            } else if (status < 0) {
+                Toast.makeText(MainActivity.this, "No se pudo completar la captura.", Toast.LENGTH_LONG).show();
+            }
+        }
+    };
+
+    private void requestRenderCapture() {
+        new AlertDialog.Builder(this)
+                .setTitle("Capturar datos gráficos")
+                .setMessage("Registra un cuadro y sus texturas en un ZIP local (hasta 64 MiB de datos). Puede causar una pausa temporal. No cambia el juego ni envía archivos automáticamente.")
+                .setPositiveButton("Capturar", (d, w) -> {
+                    if (nativeCaptureFrame(captureFile().getAbsolutePath())) {
+                        Toast.makeText(this, "Capturando el siguiente cuadro…", Toast.LENGTH_LONG).show();
+                        debugHandler.removeCallbacks(capturePoll);
+                        debugHandler.postDelayed(capturePoll, 300);
+                    } else {
+                        Toast.makeText(this, "Ya hay una captura en curso.", Toast.LENGTH_LONG).show();
+                    }
+                })
+                .setNegativeButton("Cancelar", null)
+                .show();
+    }
+
+    private void chooseCaptureDestination() {
+        // Open the Android file picker only outside gameplay: avoid destroying
+        // an active SurfaceView while the GE owns its EGL surface.
+        if (inGame || !captureFile().isFile()) return;
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("application/zip");
+        intent.putExtra(Intent.EXTRA_TITLE, "LCS-render-capture.zip");
+        startActivityForResult(intent, REQUEST_CAPTURE);
+    }
+
+    private void exportCapture(Uri destination) {
+        final File source = captureFile();
+        // Atomic native rename keeps an already-open completed ZIP immutable.
+        new Thread(() -> {
+            String message;
+            try (InputStream input = new FileInputStream(source);
+                 java.io.OutputStream output = getContentResolver().openOutputStream(destination, "w")) {
+                if (output == null) throw new IOException("No se pudo abrir el destino");
+                byte[] buffer = new byte[65536];
+                int length;
+                while ((length = input.read(buffer)) != -1) output.write(buffer, 0, length);
+                message = "Captura guardada.";
+            } catch (IOException error) {
+                message = "No se pudo guardar: " + error.getMessage();
+            }
+            final String result = message;
+            runOnUiThread(() -> {
+                if (!destroyed) Toast.makeText(this, result, Toast.LENGTH_LONG).show();
+            });
+        }, "LCS-Capture-Export").start();
+    }
+
     @Override
     public void onBackPressed() {
         if (inGame) {
-            nativeRequestStop();
+            new AlertDialog.Builder(this)
+                    .setTitle("LCS — diagnóstico")
+                    .setItems(new String[]{"Continuar", "Capturar un cuadro", "Salir al menú"},
+                            (dialog, which) -> {
+                                if (which == 1) requestRenderCapture();
+                                if (which == 2) nativeRequestStop();
+                            })
+                    .show();
             return;
         }
         super.onBackPressed();
@@ -826,6 +916,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         destroyed = true;
+        debugHandler.removeCallbacks(capturePoll);
         debugHandler.removeCallbacks(debugPoll);
         nativeRequestStop();
         nativeSetSurface(null);

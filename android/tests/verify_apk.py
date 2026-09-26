@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Check native identity, ARM64 ELF and packaged media dependencies, not gameplay."""
 from pathlib import Path
-import hashlib, subprocess, sys, zipfile
+import hashlib, re, subprocess, sys, zipfile
 apk=Path(sys.argv[1])
-sha=subprocess.check_output(['git','rev-parse','--short=12','HEAD'],text=True).strip()
-expected=('LCS Android 0.6.14 source='+sha).encode()
+root=Path(__file__).resolve().parents[2]
+sha=subprocess.check_output(['git','rev-parse','--short=12','HEAD'],cwd=root,text=True).strip()
+gradle=(root/'android/app/build.gradle').read_text()
+version=re.search(r'versionName\s+"([0-9]+\.[0-9]+\.[0-9]+)"',gradle)
+assert version is not None, 'Missing semantic Gradle version'
+expected=('LCS Android '+version.group(1)+' source='+sha).encode()
+assert expected.decode().split(' source=')[0]+' source=' in (root/'lcs/host/lcs_android_build.cpp').read_text(), 'Native and Gradle versions differ'
 with zipfile.ZipFile(apk) as z:
     name='lib/arm64-v8a/liblcsrecomp.so'; data=z.read(name)
     assert data[:5]==b'\x7fELF\x02' and int.from_bytes(data[18:20],'little')==183

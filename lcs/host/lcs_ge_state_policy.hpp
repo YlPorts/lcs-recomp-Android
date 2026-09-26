@@ -5,6 +5,21 @@
 #include <bit>
 #include <cstring>
 namespace lcs {
+// TEXBUFW is a pixel count, but direct/indexed texture rows occupy whole
+// 16-byte units. Low stride bits are ignored; a zero encoded stride still
+// occupies one unit. Compressed formats retain their pixel stride bits.
+// Verified against PPSSPP GetTextureBufw at commit
+// 46d5fae34207fc1b793215da46f7c41ee7931590, GPU/Common/TextureDecoder.cpp.
+inline std::uint32_t ge_texture_buffer_width(std::uint32_t register_value,
+                                             std::uint32_t format) noexcept {
+    constexpr std::array<std::uint32_t, 11> pixels_per_unit{
+        8u, 8u, 8u, 4u, 32u, 16u, 8u, 4u, 32u, 16u, 16u};
+    auto width = register_value & 0x7ffu;
+    if (format >= pixels_per_unit.size()) return width ? width : 1u;
+    const auto unit = pixels_per_unit[format];
+    if (format < 8u) width &= ~(unit - 1u);
+    return width ? width : unit;
+}
 // All fields consulted by the CPU vertex decoder. Texture image/sampler/CLUT
 // changes do not affect its output. Start of a GE list always invalidates reuse.
 struct GeStateRevisions {

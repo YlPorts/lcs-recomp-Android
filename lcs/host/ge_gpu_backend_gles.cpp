@@ -7,6 +7,7 @@
 #include "lcs_runtime_log.hpp"
 #include "android_host.hpp"
 #include "lcs_android_build.hpp"
+#include "lcs_render_capture.hpp"
 #include "lcs_android_gpu_policy.hpp"
 
 #include <EGL/egl.h>
@@ -31,6 +32,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -123,7 +125,7 @@ struct GlesState {
     std::uint64_t merged_clip_batches{};
     std::uint64_t validation_epoch{1u};
     std::unordered_map<std::uint32_t, GLuint> samplers;
-    std::array<std::uint32_t,19> pixel_uniform_key{};
+    std::array<std::uint32_t,21> pixel_uniform_key{};
     bool pixel_uniform_valid{};
     bool cpu_transform_uniform_valid{};
     std::uint32_t uniform_width{}, uniform_height{};
@@ -171,6 +173,7 @@ struct GlesState {
     GLint u_tex{-1};
     GLint u_texture_lod_mode{-1},u_texture_lod_bias{-1},u_texture_max_lod{-1};
     GLint u_texture_flip_v{-1};
+    GLint u_feedback_scale{-1};
     GLint u_color_test{-1};
     GLint u_color_reference{-1};
     GLint u_color_mask{-1};
@@ -444,6 +447,7 @@ uniform vec3 uBlendFixA;
 uniform vec3 uBlendFixB;
 uniform ivec4 uWriteMask;
 uniform int uTextureFlipV;
+uniform vec2 uFeedbackScale;
 uniform int uColorTest;
 uniform ivec3 uColorReference;
 uniform ivec3 uColorMask;
@@ -508,7 +512,11 @@ void main() {
     if (uTextureEnabled != 0) {
         float q = abs(vQ) < 1.0e-20 ? 1.0 : vQ;
         vec2 sampleUv = vUv / q;
-        if (uTextureFlipV != 0) sampleUv.y = 1.0 - sampleUv.y;
+        if (uTextureFlipV != 0) {
+            // Declared PSP texture extent need not equal the rendered region.
+            sampleUv *= uFeedbackScale;
+            sampleUv.y = 1.0 - sampleUv.y;
+        }
         // Match the D3D12 backend: PSP UV has already been transformed into
         // sampler space by the GE vertex path. Do not renormalize or flip here.
         // PSP constant LOD is not the host's derivative-selected mip level.
@@ -695,6 +703,7 @@ void main() {
     s.u_texture_lod_bias=glGetUniformLocation(s.program,"uTextureLodBias");
     s.u_texture_max_lod=glGetUniformLocation(s.program,"uTextureMaxLod");
     s.u_texture_flip_v = glGetUniformLocation(s.program, "uTextureFlipV");
+    s.u_feedback_scale = glGetUniformLocation(s.program, "uFeedbackScale");
     s.u_color_test = glGetUniformLocation(s.program, "uColorTest");
     s.u_color_reference = glGetUniformLocation(s.program, "uColorReference");
     s.u_color_mask = glGetUniformLocation(s.program, "uColorMask");
@@ -1248,7 +1257,17 @@ void set_transform_uniforms(
 void set_pixel_uniforms(GlesState &s, const GeGpuDrawDescriptor &draw,
                         bool textured) {
     const bool flip=draw.texture_enabled && feedback_target(s, draw.texture_address)!=s.targets.end();
-    const std::array<std::uint32_t,19> key{{
+    float feedback_x=1.0f,feedback_y=1.0f;
+    if(flip && draw.texture_width != 0u && draw.texture_height != 0u){
+        const auto &source=feedback_target(s,draw.texture_address)->second;
+        // Different row strides require address remapping, not just UV scaling.
+        // Retain the previous path for that unsupported aliasing case.
+        if(draw.texture_buffer_width == 0u || draw.texture_buffer_width == source.logical_width){
+            feedback_x=float(draw.texture_width)/float(std::max(1u,source.logical_width));
+            feedback_y=float(draw.texture_height)/float(std::max(1u,source.logical_height));
+        }
+    }
+    const std::array<std::uint32_t,21> key{{
         textured, draw.texture_function & 7u, draw.texture_use_alpha,
         draw.texture_double_color, draw.texture_env, draw.alpha_test_enabled,
         draw.alpha_function & 7u, draw.alpha_reference & 255u, draw.alpha_mask & 255u,
@@ -1257,10 +1276,12 @@ void set_pixel_uniforms(GlesState &s, const GeGpuDrawDescriptor &draw,
         draw.color_test_reference, draw.color_test_mask, flip,
         draw.texture_mipmap_enabled ? draw.texture_level_mode : 1u,
         draw.texture_mipmap_enabled ? static_cast<std::uint32_t>(draw.texture_level_offset16) : 0u,
-        draw.texture_mipmap_enabled ? draw.texture_max_level : 0u}};
+        draw.texture_mipmap_enabled ? draw.texture_max_level : 0u,
+        std::bit_cast<std::uint32_t>(feedback_x),std::bit_cast<std::uint32_t>(feedback_y)}};
     if (s.pixel_uniform_valid && key==s.pixel_uniform_key) return;
     s.pixel_uniform_key=key; s.pixel_uniform_valid=true;
     glUniform1i(s.u_tex, 0);
+    glUniform2f(s.u_feedback_scale,feedback_x,feedback_y);
     const bool mips=draw.texture_mipmap_enabled;
     glUniform1i(s.u_texture_lod_mode,!mips || draw.texture_level_mode==1u ? 1 : 0);
     glUniform1f(s.u_texture_lod_bias,mips ? float(draw.texture_level_offset16)/16.0f : 0.0f);
@@ -1580,6 +1601,9 @@ bool present_target(GlesState &s, GlesTarget &target, std::string &error) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_DEPTH_TEST);
+    // The last PSP primitive may leave clockwise front faces and back-face
+    // culling enabled. Presentation always uses its own fullscreen triangle.
+    glDisable(GL_CULL_FACE);
     glDepthMask(GL_FALSE);
     glDisable(GL_BLEND);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -2316,6 +2340,67 @@ bool upload_geometry_frame(GlesState &s,std::string &error) {
     return true;
 }
 
+
+void capture_gpu_frame(GlesState &s) noexcept {
+    if(!render_capture_has_draws())return;
+    GLint previous=0;glGetIntegerv(GL_FRAMEBUFFER_BINDING,&previous);
+    GLuint fbo=0;glGenFramebuffers(1,&fbo);
+    try{
+        std::unordered_set<std::uint64_t>images;
+        for(std::size_t i=0;i<s.batches.size();++i){
+            const auto &batch=s.batches[i];const auto &draw=batch.draw;
+            const auto prefix="gpu/batch_"+std::to_string(i);
+            std::vector<GlesStreamVertex>vertices;vertices.reserve(batch.vertices.size());
+            for(const auto &v:batch.vertices)vertices.emplace_back(v);
+            render_capture_bytes(prefix+".vertices",std::as_bytes(std::span(vertices)));
+            render_capture_bytes(prefix+".indices",std::as_bytes(std::span(batch.indices)));
+            const auto key=draw.texture_enabled?texture_lookup_key(draw):0u;
+            std::string metadata="{\"textureKey\":\""+std::to_string(key)+"\"";
+            const auto field=[&](const char*name,std::uint32_t value){
+                metadata+=",\""+std::string(name)+"\":"+std::to_string(value);
+            };
+            field("textureAddress",draw.texture_address);field("textureEnabled",draw.texture_enabled);
+            field("framebufferFeedback",draw.texture_enabled && feedback_target(s,draw.texture_address)!=s.targets.end());
+            field("textureFormat",draw.texture_format);field("textureWidth",draw.texture_width);field("textureHeight",draw.texture_height);
+            field("textureBufferWidth",draw.texture_buffer_width);
+            field("textureFunction",draw.texture_function);field("textureUseAlpha",draw.texture_use_alpha);
+            field("textureDouble",draw.texture_double_color);field("textureEnv",draw.texture_env);
+            field("framebufferAddress",draw.framebuffer_address);field("framebufferFormat",draw.framebuffer_format);
+            field("blendEnabled",draw.blend_enabled);field("blendEquation",draw.blend_equation);
+            field("blendSource",draw.blend_source_factor);field("blendDest",draw.blend_dest_factor);
+            field("blendFixSource",draw.blend_fix_source);field("blendFixDest",draw.blend_fix_dest);
+            field("alphaEnabled",draw.alpha_test_enabled);field("alphaFunction",draw.alpha_function);
+            field("alphaReference",draw.alpha_reference);field("alphaMask",draw.alpha_mask);
+            field("depthEnabled",draw.depth_test_enabled);field("depthFunction",draw.depth_function);
+            field("depthWrite",draw.depth_write_enabled);field("colorWriteMask",draw.color_write_mask);
+            field("clipCoordinates",batch.clip_coordinates);field("hardwareTransform",batch.hardware_transform);
+            field("primitive",draw.primitive);field("vertexStride",sizeof(GlesStreamVertex));
+            metadata+="}\n";render_capture_text(prefix+".json",metadata);
+            if(!draw.texture_enabled||!images.insert(key).second)continue;
+            const auto image=s.textures.find(key);
+            if(image==s.textures.end())continue; // Framebuffer feedback has no decoded-cache entry.
+            const auto &texture=image->second;
+            auto width=texture.width,height=texture.height;
+            for(std::uint32_t level=0;level<texture.levels;++level){
+                const std::uint64_t bytes=std::uint64_t(width)*height*4u;
+                if(bytes>4u*1024u*1024u){render_capture_incomplete();break;}
+                std::vector<std::byte>rgba(static_cast<std::size_t>(bytes));
+                glBindFramebuffer(GL_FRAMEBUFFER,fbo);
+                glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,texture.id,level);
+                if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){render_capture_incomplete();break;}
+                glReadPixels(0,0,width,height,GL_RGBA,GL_UNSIGNED_BYTE,rgba.data());
+                const auto name="gpu/textures/"+std::to_string(key)+"_"+std::to_string(level);
+                render_capture_bytes(name+".rgba",rgba);
+                render_capture_text(name+".json","{\"width\":"+std::to_string(width)+",\"height\":"+
+                    std::to_string(height)+",\"gpuCacheReadback\":true,\"row0AtV0\":true}\n");
+                width=std::max(1u,width/2);height=std::max(1u,height/2);
+            }
+        }
+    }catch(...){render_capture_incomplete();}
+    glBindFramebuffer(GL_FRAMEBUFFER,static_cast<GLuint>(previous));
+    if(fbo)glDeleteFramebuffers(1,&fbo);
+}
+
 bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     GlesState &s = state();
     if (!s.enabled) return false;
@@ -2435,6 +2520,24 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
         s.perf_fixed_lod=s.perf_separate_clut=s.geometry_uploaded_bytes=s.buffer_wait_ns=0;
         s.perf_window = perf_now;
     }
+    capture_gpu_frame(s);
+    if(render_capture_has_draws()&&found!=s.targets.end()&&found->second.fbo){
+        const auto &target=found->second;
+        const std::uint64_t bytes=std::uint64_t(target.render_width)*target.render_height*4u;
+        if(bytes<=16u*1024u*1024u)try{
+            std::vector<std::byte>rgba(static_cast<std::size_t>(bytes));
+            GLint previous=0;glGetIntegerv(GL_FRAMEBUFFER_BINDING,&previous);
+            glBindFramebuffer(GL_FRAMEBUFFER,target.fbo);
+            glReadPixels(0,0,target.render_width,target.render_height,GL_RGBA,GL_UNSIGNED_BYTE,rgba.data());
+            glBindFramebuffer(GL_FRAMEBUFFER,static_cast<GLuint>(previous));
+            render_capture_bytes("frame.rgba",rgba);
+            render_capture_text("frame.json","{\"width\":"+std::to_string(target.render_width)+
+                ",\"height\":"+std::to_string(target.render_height)+",\"bottomUp\":true}\n");
+        }catch(...){render_capture_incomplete();}
+        else render_capture_incomplete();
+    }
+    else if(render_capture_has_draws())render_capture_incomplete();
+    render_capture_frame_boundary();
     s.report.game_frame_vblank = vblank;
     if (drew) ++s.report.game_frames;
     s.report.offscreen_width =

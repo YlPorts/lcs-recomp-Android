@@ -43,7 +43,7 @@ loc=api('glGetUniformLocation',I,U,C.c_char_p)
 u1=api('glUniform1i',None,I,I);u2=api('glUniform2f',None,I,F,F);u3=api('glUniform3i',None,I,I,I,I)
 def seti(name,x):u1(loc(p,name.encode()),x)
 seti('uMode',2);u2(loc(p,b'uLogicalSize'),16,16);seti('uTextureEnabled',1);seti('uTexture',0);seti('uTextureFunction',3);seti('uTextureUseAlpha',1);seti('uFramebufferFormat',3)
-seti('uTextureFlipV',0);seti('uAlphaEnabled',0);seti('uFogEnabled',0);seti('uVertexColorAffine',0)
+seti('uTextureFlipV',0);u2(loc(p,b'uFeedbackScale'),1,1);seti('uAlphaEnabled',0);seti('uFogEnabled',0);seti('uVertexColorAffine',0)
 vao=U(); api('glGenVertexArrays',None,I,C.POINTER(U))(1,C.byref(vao));api('glBindVertexArray',None,U)(vao)
 vbo=U();api('glGenBuffers',None,I,C.POINTER(U))(1,C.byref(vbo));api('glBindBuffer',None,U,U)(0x8892,vbo)
 verts=[]
