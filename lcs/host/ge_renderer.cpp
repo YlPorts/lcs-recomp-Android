@@ -1309,13 +1309,48 @@ bool prepare_directional_lighting_affine(const PreparedLighting &state,
     return true;
 }
 
+// Directional lighting is independent of world position. A per-primitive
+// exact-bit cache preserves all material/light semantics and avoids recomputing
+// powers for repeated normals/vertex colours. Point/spot lights bypass it.
+class VertexLightingCache {
+    struct Entry {
+        std::array<std::uint32_t,4> key{};
+        Color output{};
+        std::uint64_t epoch{};
+    };
+    std::array<Entry,256> entries_{};
+    std::uint64_t epoch_{};
+    bool enabled_{};
+public:
+    std::uint64_t hits{},misses{};
+    void begin(const PreparedLighting &lighting) noexcept {
+        if (++epoch_==0) { for(auto &e:entries_)e.epoch=0; epoch_=1; }
+        enabled_=lighting.enabled;
+        for(const auto &l:lighting.lights) if(l.enabled && l.type!=0)enabled_=false;
+    }
+    Color apply(Color input, Vec3 position, Vec3 normal, const PreparedLighting &lighting) {
+        if(!enabled_)return apply_prepared_lighting(input,position,normal,lighting);
+        const std::array<std::uint32_t,4> key{
+            std::bit_cast<std::uint32_t>(input),std::bit_cast<std::uint32_t>(normal.x),
+            std::bit_cast<std::uint32_t>(normal.y),std::bit_cast<std::uint32_t>(normal.z)};
+        const auto hash=key[0]^(key[1]*0x9e3779b9u)^(key[2]*0x85ebca6bu)^key[3];
+        auto &entry=entries_[(hash^(hash>>16u))&255u];
+        if(entry.epoch==epoch_ && entry.key==key) {++hits;return entry.output;}
+        ++misses;
+        entry.key=key;entry.epoch=epoch_;
+        entry.output=apply_prepared_lighting(input,position,normal,lighting);
+        return entry.output;
+    }
+};
+
 template <typename VertexMemory>
 bool decode_vertex(const VertexMemory &memory, std::uint32_t address,
                    const VertexLayout &layout,
                    const std::array<std::uint32_t, 256> &commands,
                    const GeTransformState &transform,
                    Vertex &vertex, std::string &error,
-                   const PreparedLighting *prepared = nullptr) {
+                   const PreparedLighting *prepared = nullptr,
+                   VertexLightingCache *lighting_cache = nullptr) {
     if (!memory.contains(address, layout.stride)) {
         error = "GE vertex lies outside guest memory at " + psprecomp::hex32(address);
         return false;
@@ -1403,7 +1438,8 @@ bool decode_vertex(const VertexMemory &memory, std::uint32_t address,
         if ((data24(commands[0x51u]) & 1u) != 0u) world_normal = world_normal * -1.0f;
         world_normal = normalized_or_001(world_normal);
         vertex.color = prepared
-            ? apply_prepared_lighting(vertex.color, world_position, world_normal, *prepared)
+            ? (lighting_cache ? lighting_cache->apply(vertex.color,world_position,world_normal,*prepared)
+                              : apply_prepared_lighting(vertex.color, world_position, world_normal, *prepared))
             : apply_lighting(vertex.color, layout.color_type >= 4u, world_position,
                              world_normal, commands);
     }
@@ -1518,12 +1554,13 @@ bool decode_vertex_optimized(const VertexMemory &memory, std::uint32_t address,
                              const std::array<std::uint32_t, 256> &commands,
                              const GeTransformState &transform,
                              Vertex &vertex, std::string &error,
-                   const PreparedLighting *prepared = nullptr) {
+                   const PreparedLighting *prepared = nullptr,
+                   VertexLightingCache *lighting_cache = nullptr) {
     const std::uint32_t uv_mode = data24(commands[0xC0u]) & 3u;
     if (layout.type == 0x000115u && !layout.through &&
         (data24(commands[0x17u]) & 1u) == 0u && (uv_mode == 0u || uv_mode == 3u))
         return decode_vertex_0115_fast(memory, address, layout, commands, transform, vertex, error);
-    return decode_vertex(memory, address, layout, commands, transform, vertex, error, prepared);
+    return decode_vertex(memory, address, layout, commands, transform, vertex, error, prepared, lighting_cache);
 }
 
 bool decode_model_vertex_0115_for_gpu_fast(
@@ -3111,6 +3148,13 @@ bool gpu_force_white_vertex_colors_enabled() noexcept {
 }
 
 Color gpu_texture_debug_color(const GeGpuDrawDescriptor &draw, Color lighting) noexcept {
+    static const bool diagnostic = [] {
+        const char *v=std::getenv("PSPRECOMP_GE_GPU_MISSING_TEXTURE_DEBUG");
+        return v && *v && std::strcmp(v,"0")!=0;
+    }();
+    // Missing resources are reported by the GLES counter. Never inject a
+    // random artificial material colour into ordinary gameplay.
+    if (!diagnostic) return lighting;
     std::uint32_t hash = draw.texture_address ^ (draw.texture_address >> 11u) ^
                          (draw.texture_buffer_width * 0x9E3779B9u) ^
                          (draw.texture_format * 0x85EBCA6Bu);
@@ -4630,6 +4674,8 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         const bool reuse_indexed = gpu_backend_enabled && layout.index_type != 0u;
         // Material/light state is identical for all vertices in this primitive.
         const PreparedLighting primitive_lighting = prepare_lighting(layout.color_type >= 4u, commands);
+        static thread_local VertexLightingCache primitive_light_cache;
+        primitive_light_cache.begin(primitive_lighting);
 #if defined(__ANDROID__)
         const float primitive_x_scale = layout.through ? 1.0f : android_ultrawide_x_scale();
 #endif
@@ -4652,7 +4698,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             if (record == nullptr) { error = "GE vertex record outside guest memory"; return false; }
             const VertexByteView record_view{record, layout.stride};
             if (!decode_vertex_optimized(record_view, 0u, layout,
-                                         commands, transform, vertex, error, &primitive_lighting)) return false;
+                                         commands, transform, vertex, error, &primitive_lighting, &primitive_light_cache)) return false;
 #if defined(__ANDROID__)
             // SurfaceFlinger stretches the low-resolution producer buffer to the
             // physical ultrawide display. Compress 3D clip X by the inverse
@@ -4790,6 +4836,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             bool finite = true;
             for (const auto &v : vertices) {
                 finite &= finite_float(v.x) && finite_float(v.y) && finite_float(v.z) && finite_float(v.w);
+                if (!depth_clip) finite &= v.w>0.0f && v.z>=-v.w && v.z<=v.w;
                 GeGpuVertex out{};
                 out.x=v.x;out.y=v.y;out.z=v.z;out.w=v.w;
                 out.rgba=pack_gpu_color(v.color);out.u=v.u;out.v=v.v;

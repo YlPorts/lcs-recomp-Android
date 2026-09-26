@@ -55,6 +55,7 @@ public final class MainActivity extends Activity {
                                       boolean accelerate, boolean brake);
     static native void nativeRequestStop();
     static native String nativeGetDebugStatus();
+    static native String nativeGetBuildInfo();
 
     private TextView statusView;
     private Button playButton;
@@ -135,7 +136,7 @@ public final class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView info = new TextView(this);
-        info.setText("v0.6.10 · Audio + frame stability\nGTA: Liberty City Stories · ULUS-10041 v1.05");
+        info.setText(nativeGetBuildInfo() + "\nGTA: Liberty City Stories · ULUS-10041 v1.05");
         info.setTextColor(Color.LTGRAY);
         info.setTextSize(15f);
         info.setGravity(Gravity.CENTER);
@@ -224,7 +225,7 @@ public final class MainActivity extends Activity {
         if (!marker.isFile() && !runtimeLog.isFile() && systemExit == null) return null;
 
         StringBuilder report = new StringBuilder();
-        report.append("ÚLTIMO CIERRE / DIAGNÓSTICO\n");
+        report.append("ÚLTIMA EJECUCIÓN / DIAGNÓSTICO\n");
         if (systemExit != null) report.append(systemExit).append('\n');
         try {
             if (marker.isFile()) {

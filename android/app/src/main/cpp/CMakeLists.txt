@@ -83,6 +83,19 @@ target_compile_definitions(lcsrecomp PRIVATE
 )
 target_compile_options(lcsrecomp PRIVATE -O2 -fexceptions -frtti)
 
+# Only this translation unit changes when the source SHA changes: do not
+# invalidate the huge AOT corpus merely to stamp a version string.
+execute_process(COMMAND git rev-parse --short=12 HEAD
+    WORKING_DIRECTORY "${REPO_ROOT}"
+    OUTPUT_VARIABLE LCS_ANDROID_SOURCE_SHA
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(NOT LCS_ANDROID_SOURCE_SHA MATCHES "^[0-9a-f]+$")
+    set(LCS_ANDROID_SOURCE_SHA "unversioned")
+endif()
+set_source_files_properties("${REPO_ROOT}/lcs/host/lcs_android_build.cpp"
+    PROPERTIES COMPILE_DEFINITIONS "LCS_ANDROID_SOURCE_SHA=\"${LCS_ANDROID_SOURCE_SHA}\"")
+
 find_library(ANDROID_LIB android)
 find_library(LOG_LIB log)
 find_library(EGL_LIB EGL)

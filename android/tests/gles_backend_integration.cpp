@@ -12,6 +12,8 @@ float ultrawide_x_scale() noexcept{return 1;}
 }
 }
 using namespace lcs;
+extern "C" std::uint32_t lcs_reference_blend(std::uint32_t,std::uint32_t,
+    unsigned,unsigned,unsigned,std::uint32_t,std::uint32_t,std::uint32_t);
 std::array<GeGpuVertex,6> quad(float x0,float y0,float x1,float y1,float tw=1,float th=1){
     std::array<GeGpuVertex,6> v{};
     const float a[6][4]={{x0,y0,0,0},{x1,y0,tw,0},{x1,y1,tw,th},{x0,y0,0,0},{x1,y1,tw,th},{x0,y1,0,th}};
@@ -62,7 +64,18 @@ int main(){
     GeGpuClipViewport vp{};
     assert(build_ge_gpu_clip_viewport(8,-8,32767,8,8,32767,true,vp));
     assert(!build_ge_gpu_clip_viewport(8,-8,32767,8.2f,8,32767,true,vp));
-    assert(!build_ge_gpu_clip_viewport(8,-8,32767,8,8,32767,false,vp));
+    assert(build_ge_gpu_clip_viewport(8,-8,32767,8,8,32767,false,vp));
+    assert(vp.requires_inside_depth);
+    {
+        std::array<GeGpuVertex,3> v{};
+        v[0].z=2.0f; // outside [-w,w]: CPU fallback must stay active.
+        const auto before=s.batches.size();
+        assert(!ge_gpu_backend_accumulate_clip_vertices(color,vp,v));
+        assert(s.batches.size()==before);
+        v[0].z=0.5f;
+        assert(ge_gpu_backend_accumulate_clip_vertices(color,vp,v));
+        s.batches.clear();
+    }
     assert(build_ge_gpu_clip_viewport(8,-8,32767,8,8,32767,true,vp));
     auto clear_target=[&] {
         glBindFramebuffer(GL_FRAMEBUFFER,s.targets.at(0x10000u).fbo);
@@ -88,13 +101,16 @@ int main(){
         }
         clear_target();ge_gpu_backend_accumulate_color_triangles(color,screen);
         assert(ge_gpu_backend_finish_color_frame(3+test*2));const auto reference=read_all();
-        clear_target();assert(ge_gpu_backend_accumulate_clip_vertices(color,vp,clip));
+        clear_target();
+        vp.requires_inside_depth=(test & 1u)!=0u;
+        assert(ge_gpu_backend_accumulate_clip_vertices(color,vp,clip));
         assert(ge_gpu_backend_finish_color_frame(4+test*2));const auto actual=read_all();
         unsigned bad=0;
         for(unsigned i=0;i<actual.size();i++)if(std::abs(int(actual[i])-int(reference[i]))>1)bad++;
         assert(bad<=8); // Allow edge-coverage rounding only.
     }
     std::cout<<"PASS: 120 actual GLES clip/viewport images match screen-space reference\n";
+    vp.requires_inside_depth=false;
     // Flat color is the provoking (last) vertex, and culling direction agrees
     // with the old screen-space area test. Depth-clip rejects out-of-frustum Z.
     std::array<GeGpuVertex,3> tri{};
@@ -116,5 +132,47 @@ int main(){
     assert(glGetError()==GL_NO_ERROR);
     std::cout<<"PASS: actual flat shading, winding and depth clipping; no GL errors\n";
 
+
+    // The old backend silently disabled every unrecognized blend pair. Compare
+    // every supported PSP factor/equation against the ACTUAL software blender.
+    unsigned blend_cases=0;
+    vp.flat_shading=false;
+    const std::array<std::uint32_t,3> sources{0x4070dc28u,0xc87c25d9u,0xff20ff10u};
+    const std::uint32_t destination=0x70523b91u;
+    for(unsigned eq=0;eq<6;eq++) for(unsigned fa=0;fa<=10;fa++)
+    for(unsigned fb=0;fb<=10;fb++) for(auto source:sources) {
+        auto b=color;
+        b.blend_enabled=true;b.blend_equation=eq;b.blend_source_factor=fa;b.blend_dest_factor=fb;
+        b.blend_fix_source=0x2963c9;b.blend_fix_dest=0xcf2591;
+        b.color_write_mask=(blend_cases%3u)==0?0x00F0330Fu:0u;
+        clear_target();
+        glClearColor((destination&255)/255.f,((destination>>8)&255)/255.f,
+                     ((destination>>16)&255)/255.f,((destination>>24)&255)/255.f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        auto v=quad(0,0,16,16);for(auto &x:v)x.rgba=source;
+        ge_gpu_backend_accumulate_color_triangles(b,v);
+        assert(ge_gpu_backend_finish_color_frame(500+blend_cases));
+        auto actual=pixel(5,8);
+        auto expected=lcs_reference_blend(source,destination,eq,fa,fb,b.blend_fix_source,b.blend_fix_dest,b.color_write_mask);
+        for(unsigned channel=0;channel<4;channel++) {
+            const int want=(expected>>(8u*channel))&255u;
+            if(std::abs(int(actual[channel])-want)>1) {
+                std::cerr<<"blend mismatch eq="<<eq<<" fa="<<fa<<" fb="<<fb<<" channel="<<channel<<" expected="<<want<<" actual="<<int(actual[channel])<<" mask="<<std::hex<<b.color_write_mask<<std::dec<<'\n';
+                return 1;
+            }
+        }
+        ++blend_cases;
+    }
+    assert(glGetError()==GL_NO_ERROR);
+    std::cout<<"PASS: "<<blend_cases<<" actual GLES blend images vs software reference, including independent FIXA/FIXB, double factors, subtract/min/max/absdiff and partial masks\n";
+    // Within one batch, overlapped programmable blends must see previous triangles.
+    auto b=color;b.blend_enabled=true;b.blend_equation=5;b.blend_source_factor=10;b.blend_dest_factor=10;
+    auto v=quad(0,0,16,16);for(auto &x:v)x.rgba=0xff22cc66;
+    clear_target();
+    ge_gpu_backend_accumulate_color_triangles(b,v);
+    ge_gpu_backend_accumulate_color_triangles(b,v);
+    assert(ge_gpu_backend_finish_color_frame(9999));
+    assert(pixel(5,8)[0]==0 && pixel(5,8)[1]==0 && pixel(5,8)[2]==0);
+    std::cout<<"PASS: ordered overlapping programmable-blend triangles, coherentFetch="<<s.framebuffer_fetch_enabled<<"\n";
     destroy_backend(s);
 }

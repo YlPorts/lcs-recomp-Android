@@ -11,6 +11,7 @@
 
 #if defined(__ANDROID__)
 #include "android_debug.hpp"
+#include "lcs_android_build.hpp"
 #endif
 
 #include <algorithm>
@@ -58,6 +59,10 @@ int main(int argc, char **argv) {
         lcs::initialize_lcs_render_configuration(executable_directory);
         lcs::runtime_log_initialize(lcs::lcs_render_configuration());
         lcs::runtime_log_line("main: configuration initialized");
+#if defined(__ANDROID__)
+        lcs::runtime_log_line(lcs::android_build_identity());
+        lcs::runtime_log_line("android: media=ffmpeg raster=gles cpuModelTransform=true");
+#endif
 
         auto elf = psprecomp::Elf32Image::from_file(elf_path);
 #if defined(__ANDROID__)

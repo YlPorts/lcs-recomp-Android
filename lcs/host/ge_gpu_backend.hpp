@@ -148,6 +148,7 @@ struct GeGpuClipViewport {
     bool cull_enabled{};
     bool accept_counter_clockwise{};
     bool flat_shading{};
+    bool requires_inside_depth{};
     bool operator==(const GeGpuClipViewport &) const = default;
 };
 // Conservative eligibility: use the established CPU route for subpixel or
@@ -155,7 +156,8 @@ struct GeGpuClipViewport {
 inline bool build_ge_gpu_clip_viewport(float sx,float sy,float sz,
                                        float cx,float cy,float cz,
                                        bool depth_clip, GeGpuClipViewport &out) noexcept {
-    if (!depth_clip || !(sx > 0.0f) || !(sy < 0.0f) ||
+    out.requires_inside_depth = !depth_clip;
+    if (!(sx > 0.0f) || !(sy < 0.0f) ||
         !std::isfinite(sx+sy+sz+cx+cy+cz)) return false;
     const float v[4]{cx-sx,cy+sy,2.0f*sx,-2.0f*sy};
     for (float f:v) if (std::abs(f)>16384.0f || std::abs(f-std::round(f))>0.0001f) return false;

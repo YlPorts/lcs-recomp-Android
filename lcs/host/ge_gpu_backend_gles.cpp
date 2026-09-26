@@ -5,6 +5,7 @@
 #include "lcs_render_config.hpp"
 #include "lcs_runtime_log.hpp"
 #include "android_host.hpp"
+#include "lcs_android_build.hpp"
 #include "lcs_android_gpu_policy.hpp"
 
 #include <EGL/egl.h>
@@ -57,6 +58,7 @@ struct GlesTarget {
     GLuint depth{};
     GLuint fbo{};
     GLuint feedback{};
+    GLuint blend_copy{};
     bool cleared{};
 };
 
@@ -76,6 +78,7 @@ struct GlesState {
     bool initialized{};
     bool enabled{};
     bool gl_ready{};
+    bool framebuffer_fetch_enabled{};
     bool direct_present_ok{};
     std::thread::id gl_thread{};
     std::uint32_t scale{2u};
@@ -109,6 +112,7 @@ struct GlesState {
     GLuint vao{};
     GLuint vbo{};
     GLuint ebo{};
+    GLuint blend_ebo{};
     GLuint present_vao{};
 
     GLint u_mode{-1};
@@ -145,6 +149,11 @@ struct GlesState {
     GLint u_framebuffer_format{-1};
 
     GLint u_present_tex{-1};
+    GLint u_blend_read{-1}, u_blend_equation{-1}, u_blend_factors{-1};
+    GLint u_blend_fix_a{-1}, u_blend_fix_b{-1}, u_write_mask{-1};
+    GLint u_destination{-1};
+    std::uint64_t perf_blend_fallbacks{}, perf_missing_textures{};
+    std::array<std::uint64_t, 6> perf_blend_equations{};
 
     std::unordered_map<std::uint64_t, GlesTexture> textures;
     android_detail::TextureVersions texture_versions;
@@ -251,10 +260,12 @@ GLuint link_program(const char *vs_source, const char *fs_source, std::string &e
 
 void delete_target(GlesTarget &target) noexcept {
     if (target.feedback != 0u) glDeleteTextures(1, &target.feedback);
+    if (target.blend_copy != 0u) glDeleteTextures(1, &target.blend_copy);
     if (target.fbo != 0u) glDeleteFramebuffers(1, &target.fbo);
     if (target.depth != 0u) glDeleteRenderbuffers(1, &target.depth);
     if (target.color != 0u) glDeleteTextures(1, &target.color);
     target.feedback = 0u;
+    target.blend_copy = 0u;
     target.fbo = 0u;
     target.depth = 0u;
     target.color = 0u;
@@ -285,11 +296,12 @@ void destroy_gl_objects(GlesState &s) noexcept {
     s.targets.clear();
     if (s.vbo != 0u) glDeleteBuffers(1, &s.vbo);
     if (s.ebo != 0u) glDeleteBuffers(1, &s.ebo);
+    if (s.blend_ebo != 0u) glDeleteBuffers(1, &s.blend_ebo);
     if (s.vao != 0u) glDeleteVertexArrays(1, &s.vao);
     if (s.present_vao != 0u) glDeleteVertexArrays(1, &s.present_vao);
     if (s.program != 0u) glDeleteProgram(s.program);
     if (s.present_program != 0u) glDeleteProgram(s.present_program);
-    s.vbo = s.ebo = s.vao = s.present_vao = 0u;
+    s.vbo = s.ebo = s.blend_ebo = s.vao = s.present_vao = 0u;
     s.program = s.present_program = 0u;
     s.gl_ready = false;
 }
@@ -367,6 +379,13 @@ precision highp float;
 precision highp int;
 
 uniform sampler2D uTexture;
+uniform sampler2D uDestination;
+uniform int uBlendRead;
+uniform int uBlendEquation;
+uniform ivec2 uBlendFactors;
+uniform vec3 uBlendFixA;
+uniform vec3 uBlendFixB;
+uniform ivec4 uWriteMask;
 uniform int uTextureFlipV;
 uniform int uColorTest;
 uniform ivec3 uColorReference;
@@ -392,7 +411,11 @@ uniform int uFlatShading;
 in vec2 vUv;
 in float vFogFactor;
 in float vQ;
+#ifdef LCS_COHERENT_FETCH
+layout(location = 0) inout highp vec4 outColor;
+#else
 out vec4 outColor;
+#endif
 
 bool alphaPass(int fn, int lhs, int rhs) {
     if (fn == 0) return false;
@@ -409,6 +432,20 @@ float quantize(float value, float levels) {
     return floor(clamp(value, 0.0, 1.0) * levels + 0.5) / levels;
 }
 
+ivec4 blendFactorBytes(int factor, bool sourceFactor, ivec4 src, ivec4 dst, vec3 fixColor) {
+    if (factor == 0) return sourceFactor ? dst : src;
+    if (factor == 1) return ivec4(255) - (sourceFactor ? dst : src);
+    if (factor == 2) return ivec4(src.a);
+    if (factor == 3) return ivec4(255-src.a);
+    if (factor == 4) return ivec4(dst.a);
+    if (factor == 5) return ivec4(255-dst.a);
+    if (factor == 6) return ivec4(min(255,2*src.a));
+    if (factor == 7) return ivec4(min(255,2*(255-src.a)));
+    if (factor == 8) return ivec4(min(255,2*dst.a));
+    if (factor == 9) return ivec4(min(255,2*(255-dst.a)));
+    if (factor == 10) return ivec4(ivec3(floor(fixColor*255.0+0.5)),255);
+    return ivec4(255);
+}
 void main() {
     vec4 color = clamp(uFlatShading != 0 ? vFlatColor : vColor, 0.0, 1.0);
     if (uTextureEnabled != 0) {
@@ -455,6 +492,28 @@ void main() {
             discard;
     }
 
+    vec4 destination = vec4(0.0);
+    if (uBlendRead != 0) {
+#ifdef LCS_COHERENT_FETCH
+        destination = outColor;
+#else
+        destination = texelFetch(uDestination, ivec2(gl_FragCoord.xy), 0);
+#endif
+        if (uBlendEquation >= 0) {
+            ivec4 src=ivec4(floor(clamp(color,0.0,1.0)*255.0+0.5));
+            ivec4 dst=ivec4(floor(destination*255.0+0.5));
+            ivec4 a=src*blendFactorBytes(uBlendFactors.x,true,src,dst,uBlendFixA);
+            ivec4 b=dst*blendFactorBytes(uBlendFactors.y,false,src,dst,uBlendFixB);
+            ivec4 bytes;
+            if (uBlendEquation == 1) bytes=(max(a-b,ivec4(0))+127)/255;
+            else if (uBlendEquation == 2) bytes=(max(b-a,ivec4(0))+127)/255;
+            else if (uBlendEquation == 3) bytes=min(src,dst);
+            else if (uBlendEquation == 4) bytes=max(src,dst);
+            else if (uBlendEquation == 5) bytes=abs(src-dst);
+            else bytes=(a+b+127)/255;
+            color=vec4(clamp(bytes,ivec4(0),ivec4(255)))/255.0;
+        }
+    }
     if (uFramebufferFormat == 0) {
         color.r = quantize(color.r, 31.0);
         color.g = quantize(color.g, 63.0);
@@ -468,6 +527,11 @@ void main() {
                      quantize(color.b,15.0), quantize(color.a,15.0));
     }
 
+    if (uBlendRead != 0) {
+        ivec4 srcBytes=ivec4(floor(clamp(color,0.0,1.0)*255.0+0.5));
+        ivec4 dstBytes=ivec4(floor(destination*255.0+0.5));
+        color=vec4((srcBytes & ~uWriteMask) | (dstBytes & uWriteMask))/255.0;
+    }
     outColor = color;
 }
 )GLSL";
@@ -495,14 +559,36 @@ void main() {
 }
 )GLSL";
 
-    s.program = link_program(kVertexShader, kFragmentShader, error);
+    // Coherent framebuffer fetch keeps custom PSP blending on-chip where
+    // advertised. Noncoherent-only implementations use the ordered copy path.
+    const auto *extensions = reinterpret_cast<const char *>(glGetString(GL_EXTENSIONS));
+    const std::string advertised = std::string(" ") + (extensions ? extensions : "") + " ";
+    const char *fetch_setting = std::getenv("PSPRECOMP_GLES_FB_FETCH");
+    s.framebuffer_fetch_enabled =
+        advertised.find(" GL_EXT_shader_framebuffer_fetch ") != std::string::npos &&
+        !(fetch_setting && std::strcmp(fetch_setting,"0")==0);
+    if (s.framebuffer_fetch_enabled) {
+        std::string source = kFragmentShader;
+        source.insert(source.find('\n')+1,
+            "#extension GL_EXT_shader_framebuffer_fetch : require\n#define LCS_COHERENT_FETCH 1\n");
+        s.program = link_program(kVertexShader, source.c_str(), error);
+        if (!s.program) {
+            runtime_log_error("gles: framebuffer-fetch shader fallback", error);
+            s.framebuffer_fetch_enabled = false;
+            error.clear();
+        }
+    }
+    if (!s.framebuffer_fetch_enabled) s.program = link_program(kVertexShader, kFragmentShader, error);
     if (s.program == 0u) return false;
+    runtime_log_line(std::string("gles: programmableBlend=") +
+        (s.framebuffer_fetch_enabled ? "coherent-framebuffer-fetch" : "ordered-copy"));
     s.present_program = link_program(kPresentVertex, kPresentFragment, error);
     if (s.present_program == 0u) return false;
 
     glGenVertexArrays(1, &s.vao);
     glGenBuffers(1, &s.vbo);
     glGenBuffers(1, &s.ebo);
+    glGenBuffers(1, &s.blend_ebo);
     glGenVertexArrays(1, &s.present_vao);
     if (s.vao == 0u || s.vbo == 0u || s.ebo == 0u || s.present_vao == 0u) {
         error = gl_error("create GLES buffers");
@@ -562,6 +648,13 @@ void main() {
     s.u_fog_color = glGetUniformLocation(s.program, "uFogColor");
     s.u_framebuffer_format = glGetUniformLocation(s.program, "uFramebufferFormat");
     s.u_present_tex = glGetUniformLocation(s.present_program, "uPresentTexture");
+    s.u_blend_read=glGetUniformLocation(s.program,"uBlendRead");
+    s.u_blend_equation=glGetUniformLocation(s.program,"uBlendEquation");
+    s.u_blend_factors=glGetUniformLocation(s.program,"uBlendFactors");
+    s.u_blend_fix_a=glGetUniformLocation(s.program,"uBlendFixA");
+    s.u_blend_fix_b=glGetUniformLocation(s.program,"uBlendFixB");
+    s.u_write_mask=glGetUniformLocation(s.program,"uWriteMask");
+    s.u_destination=glGetUniformLocation(s.program,"uDestination");
 
     glBindVertexArray(0);
     s.gl_ready = true;
@@ -889,74 +982,71 @@ GLenum depth_func(std::uint32_t function) noexcept {
     }
 }
 
-std::size_t blend_variant(const GeGpuDrawDescriptor &draw) noexcept {
-    if (!draw.blend_enabled || draw.clear_mode) return 0u;
-    const std::uint32_t eq = draw.blend_equation & 7u;
-    const std::uint32_t src = draw.blend_source_factor & 0xFu;
-    const std::uint32_t dst = draw.blend_dest_factor & 0xFu;
-    if (eq == 0u && src == 2u && dst == 3u) return 1u;
-    if (eq == 0u && src == 10u && dst == 10u) {
-        const std::uint32_t fs = draw.blend_fix_source & 0x00FFFFFFu;
-        const std::uint32_t fd = draw.blend_fix_dest & 0x00FFFFFFu;
-        if (fs == 0x00FFFFFFu && fd == 0u) return 2u;
-        if (fs == 0x00FFFFFFu && fd == 0x00FFFFFFu) return 3u;
-        bool complements = true;
-        for (std::uint32_t shift = 0u; shift < 24u; shift += 8u)
-            complements &=
-                (((fs >> shift) & 0xFFu) + ((fd >> shift) & 0xFFu)) == 0xFFu;
-        if (complements) return 4u;
+struct GlesBlendPlan {
+    bool enabled{}, shader{};
+    GLenum equation{GL_FUNC_ADD};
+    GLenum source{GL_ONE}, destination{GL_ZERO};
+    GLenum source_alpha{GL_ONE}, destination_alpha{GL_ZERO};
+    std::uint32_t constant{};
+};
+GlesBlendPlan blend_plan(const GeGpuDrawDescriptor &draw) noexcept {
+    GlesBlendPlan plan{};
+    if (draw.clear_mode) return plan;
+    for (unsigned i=0;i<4;i++) {
+        const auto bits=(draw.color_write_mask>>(8*i))&255u;
+        if (bits!=0u && bits!=255u) plan.shader=true;
     }
-    if (eq == 0u && src == 2u && dst == 10u &&
-        (draw.blend_fix_dest & 0x00FFFFFFu) == 0x00FFFFFFu) return 5u;
-    return 0u;
+    plan.enabled=draw.blend_enabled;
+    if (!plan.enabled) return plan;
+    static constexpr GLenum equations[]{GL_FUNC_ADD,GL_FUNC_SUBTRACT,GL_FUNC_REVERSE_SUBTRACT,GL_MIN,GL_MAX};
+    const auto eq=draw.blend_equation&7u;
+    if (eq>=5u) { plan.shader=true; return plan; }
+    plan.equation=equations[eq];
+    // MIN/MAX ignore factors. Other equations on low-bit framebuffers need
+    // quantization after blending, not the old pre-blend shader quantization.
+    if ((draw.framebuffer_format&3u)!=3u) plan.shader=true;
+    if (eq==3u || eq==4u) return plan;
+    bool have_constant=false;
+    const auto map=[&](unsigned factor,bool source,std::uint32_t fixed,GLenum &rgb,GLenum &alpha) {
+        fixed &= 0xFFFFFFu;
+        switch (factor&15u) {
+        case 0: rgb=source?GL_DST_COLOR:GL_SRC_COLOR;alpha=source?GL_DST_ALPHA:GL_SRC_ALPHA;break;
+        case 1: rgb=source?GL_ONE_MINUS_DST_COLOR:GL_ONE_MINUS_SRC_COLOR;alpha=source?GL_ONE_MINUS_DST_ALPHA:GL_ONE_MINUS_SRC_ALPHA;break;
+        case 2: rgb=alpha=GL_SRC_ALPHA;break;
+        case 3: rgb=alpha=GL_ONE_MINUS_SRC_ALPHA;break;
+        case 4: rgb=alpha=GL_DST_ALPHA;break;
+        case 5: rgb=alpha=GL_ONE_MINUS_DST_ALPHA;break;
+        case 10:
+            alpha=GL_ONE;
+            if (fixed==0u) rgb=GL_ZERO;
+            else if (fixed==0xFFFFFFu) rgb=GL_ONE;
+            else if (!have_constant) { have_constant=true;plan.constant=fixed;rgb=GL_CONSTANT_COLOR; }
+            else if (fixed==plan.constant) rgb=GL_CONSTANT_COLOR;
+            else if (fixed==(plan.constant^0xFFFFFFu)) rgb=GL_ONE_MINUS_CONSTANT_COLOR;
+            else plan.shader=true;
+            break;
+        default: plan.shader=true;break;
+        }
+    };
+    map(draw.blend_source_factor,true,draw.blend_fix_source,plan.source,plan.source_alpha);
+    map(draw.blend_dest_factor,false,draw.blend_fix_dest,plan.destination,plan.destination_alpha);
+    return plan;
 }
-
 void apply_draw_state(const GeGpuDrawDescriptor &draw) {
     if (draw.depth_test_enabled || (draw.clear_mode && draw.clear_depth)) {
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(draw.clear_mode ? GL_ALWAYS : depth_func(draw.depth_function));
-    } else {
-        glDisable(GL_DEPTH_TEST);
-    }
+    } else glDisable(GL_DEPTH_TEST);
     glDepthMask(draw.depth_write_enabled ? GL_TRUE : GL_FALSE);
-
-    const std::size_t variant = blend_variant(draw);
-    if (variant == 0u || variant == 2u) {
-        glDisable(GL_BLEND);
-    } else {
-        glEnable(GL_BLEND);
-        glBlendEquation(GL_FUNC_ADD);
-        switch (variant) {
-        case 1u:
-            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
-                                GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-            break;
-        case 3u:
-            glBlendFunc(GL_ONE, GL_ONE);
-            break;
-        case 4u: {
-            const std::uint32_t fix = draw.blend_fix_source & 0x00FFFFFFu;
-            glBlendColor(
-                static_cast<float>(fix & 0xFFu) / 255.0f,
-                static_cast<float>((fix >> 8u) & 0xFFu) / 255.0f,
-                static_cast<float>((fix >> 16u) & 0xFFu) / 255.0f,
-                1.0f);
-            glBlendFunc(GL_CONSTANT_COLOR, GL_ONE_MINUS_CONSTANT_COLOR);
-            break;
-        }
-        case 5u:
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-            break;
-        default:
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            break;
-        }
-    }
-
-    const auto writable = [&](std::uint32_t channel) {
-        return ((draw.color_write_mask >> (channel * 8u)) & 0xFFu) != 0xFFu;
-    };
-    glColorMask(writable(0u), writable(1u), writable(2u), writable(3u));
+    const auto plan=blend_plan(draw);
+    if (plan.enabled && !plan.shader) {
+        glEnable(GL_BLEND); glBlendEquation(plan.equation);
+        glBlendColor((plan.constant&255u)/255.0f,((plan.constant>>8u)&255u)/255.0f,
+                     ((plan.constant>>16u)&255u)/255.0f,1.0f);
+        glBlendFuncSeparate(plan.source,plan.destination,plan.source_alpha,plan.destination_alpha);
+    } else glDisable(GL_BLEND);
+    const auto writable=[&](unsigned n) { return ((draw.color_write_mask>>(8u*n))&255u)!=255u; };
+    glColorMask(writable(0),writable(1),writable(2),writable(3));
 }
 
 std::array<float, 4> transform_row(
@@ -1179,6 +1269,47 @@ void bind_draw_sampler(GlesState &s, const GeGpuDrawDescriptor &draw, GLuint tex
     glBindSampler(0,it->second);
 }
 
+void set_programmable_blend_uniforms(GlesState &s, const GlesBatch &batch) {
+    glUniform1i(s.u_blend_read,1);
+    glUniform1i(s.u_destination,1);
+    glUniform1i(s.u_blend_equation,batch.draw.blend_enabled ? (batch.draw.blend_equation&7u) : -1);
+    glUniform2i(s.u_blend_factors,batch.draw.blend_source_factor&15u,batch.draw.blend_dest_factor&15u);
+    const auto fixed=[](GLint loc,std::uint32_t f) { glUniform3f(loc,(f&255u)/255.0f,((f>>8u)&255u)/255.0f,((f>>16u)&255u)/255.0f); };
+    fixed(s.u_blend_fix_a,batch.draw.blend_fix_source);fixed(s.u_blend_fix_b,batch.draw.blend_fix_dest);
+    const auto mask=batch.draw.color_write_mask;
+    glUniform4i(s.u_write_mask,mask&255u,(mask>>8u)&255u,(mask>>16u)&255u,(mask>>24u)&255u);
+}
+
+void draw_ordered_blend(GlesState &s, GlesTarget &target, const GlesBatch &batch, GLenum mode) {
+    set_programmable_blend_uniforms(s,batch);
+    glActiveTexture(GL_TEXTURE1);
+    if (!target.blend_copy) {
+        glGenTextures(1,&target.blend_copy);glBindTexture(GL_TEXTURE_2D,target.blend_copy);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAX_LEVEL,0);
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,target.render_width,target.render_height,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
+    } else glBindTexture(GL_TEXTURE_2D,target.blend_copy);
+    glBindSampler(1,0);
+    const std::size_t count=batch.indices.empty()?batch.vertices.size():batch.indices.size();
+    const auto index=[&](std::size_t i) {return batch.first_vertex+(batch.indices.empty()?static_cast<std::uint32_t>(i):batch.indices[i]);};
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,s.blend_ebo);
+    const auto emit=[&](std::size_t a,std::size_t b,std::size_t c) {
+        const std::array<std::uint32_t,3> ids{index(a),index(b),index(c)};
+        glCopyTexSubImage2D(GL_TEXTURE_2D,0,0,0,0,0,target.render_width,target.render_height);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,sizeof(ids),ids.data(),GL_STREAM_DRAW);
+        glDrawElements(GL_TRIANGLES,3,GL_UNSIGNED_INT,nullptr);
+    };
+    if (mode==GL_TRIANGLE_STRIP) {
+        for(std::size_t i=0;i+2<count;i++) emit(i+(i&1),i+1-(i&1),i+2);
+    } else if(mode==GL_TRIANGLE_FAN) {
+        for(std::size_t i=1;i+1<count;i++) emit(0,i,i+1);
+    } else for(std::size_t i=0;i+2<count;i+=3) emit(i,i+1,i+2);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,s.ebo);
+    glActiveTexture(GL_TEXTURE0);
+    ++s.perf_blend_fallbacks;
+}
+
 bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
     GlesTarget &target = target_metadata(s, batch.draw.framebuffer_address);
     if (s.frame_epoch <= 12u) {
@@ -1258,6 +1389,7 @@ bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
     glActiveTexture(GL_TEXTURE0);
     const GLuint texture = texture_for_draw(s, batch.draw, &target);
     const bool textured = batch.draw.texture_enabled && texture != 0u;
+    if (batch.draw.texture_enabled && !texture) ++s.perf_missing_textures;
     if (textured) bind_draw_sampler(s, batch.draw, texture);
     else glBindTexture(GL_TEXTURE_2D, 0u);
     set_pixel_uniforms(s, batch.draw, textured);
@@ -1270,7 +1402,17 @@ bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
         batch.indices.empty())
         mode = GL_TRIANGLE_STRIP;
 
-    if (!batch.indices.empty()) {
+    const auto plan=blend_plan(batch.draw);
+    glUniform1i(s.u_blend_read,0);
+    if (batch.draw.blend_enabled && (batch.draw.blend_equation&7u)<6u)
+        ++s.perf_blend_equations[batch.draw.blend_equation&7u];
+    if (plan.shader && s.framebuffer_fetch_enabled) {
+        set_programmable_blend_uniforms(s,batch);
+        ++s.perf_blend_fallbacks;
+    }
+    if (plan.shader && !s.framebuffer_fetch_enabled) {
+        draw_ordered_blend(s,target,batch,mode);
+    } else if (!batch.indices.empty()) {
         const std::uintptr_t index_offset =
             static_cast<std::uintptr_t>(batch.first_index) * sizeof(std::uint32_t);
         glDrawElements(mode, static_cast<GLsizei>(batch.indices.size()),
@@ -1332,6 +1474,7 @@ bool present_target(GlesState &s, GlesTarget &target, std::string &error) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glUniform1i(s.u_present_tex, 0);
+    glBindSampler(1,0);
     glBindVertexArray(s.present_vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
@@ -1813,6 +1956,11 @@ bool ge_gpu_backend_accumulate_clip_vertices(const GeGpuDrawDescriptor &input_dr
     if (!s.enabled || (setting && std::strcmp(setting,"0")==0) || vertices.empty()) return false;
     const auto draw=snapshot_texture_draw(input_draw);
     if (draw.primitive<3u || draw.primitive>5u || draw.through || draw.clear_mode) return false;
+    if (viewport.requires_inside_depth) {
+        for (const auto &v : vertices)
+            if (!std::isfinite(v.x+v.y+v.z+v.w) || !(v.w>0) || v.z < -v.w || v.z > v.w)
+                return false; // No draw consumed; CPU route retains PSP depth behaviour.
+    }
     try {
         GlesBatch batch{};
         batch.draw=draw;batch.clip_coordinates=true;batch.clip_viewport=viewport;
@@ -2052,13 +2200,24 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     if (presented) ++s.perf_presents;
     const double wall_s = std::chrono::duration<double>(perf_now - s.perf_window).count();
     if (wall_s >= 2.0) {
-        runtime_log_line("perf: presentFPS=" + std::to_string(s.perf_presents/wall_s) +
+        runtime_log_line(std::string(android_build_identity()) + "\nperf: presentFPS=" + std::to_string(s.perf_presents/wall_s) +
             " presentCalls=" + std::to_string(s.perf_presents) +
             " finishCalls=" + std::to_string(s.perf_epochs) +
             " wallSec=" + std::to_string(wall_s) +
             " colorTestDraws=" + std::to_string(s.perf_color_tests)+
             " gpuClipDraws="+std::to_string(s.perf_clip_draws)+
-            " gpuClipVertices="+std::to_string(s.perf_clip_vertices));
+            " gpuClipVertices="+std::to_string(s.perf_clip_vertices)+
+            " blendFetch="+std::to_string(s.framebuffer_fetch_enabled ? 1 : 0)+
+            " blendFallbacks="+std::to_string(s.perf_blend_fallbacks)+
+            " missingTextures="+std::to_string(s.perf_missing_textures)+
+            " blends="+std::to_string(s.perf_blend_equations[0])+","+
+                std::to_string(s.perf_blend_equations[1])+","+
+                std::to_string(s.perf_blend_equations[2])+","+
+                std::to_string(s.perf_blend_equations[3])+","+
+                std::to_string(s.perf_blend_equations[4])+","+
+                std::to_string(s.perf_blend_equations[5]));
+        s.perf_blend_equations.fill(0);
+        s.perf_blend_fallbacks=s.perf_missing_textures=0;
         s.perf_clip_draws=s.perf_clip_vertices=0;
         s.perf_presents = s.perf_epochs = s.perf_color_tests = 0;
         s.perf_window = perf_now;

@@ -1,5 +1,6 @@
 #include "android_host.hpp"
 #include "android_debug.hpp"
+#include "lcs_android_build.hpp"
 #include "ge_gpu_backend.hpp"
 #include "psprecomp/runtime.hpp"
 
@@ -117,6 +118,11 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_ylports_lcsrecomp_MainActivity_nativeRequestStop(
     JNIEnv *, jclass) {
     lcs::android_host::request_stop();
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ylports_lcsrecomp_MainActivity_nativeGetBuildInfo(JNIEnv *env, jclass) {
+    return env->NewStringUTF(lcs::android_build_identity());
 }
 
 extern "C" JNIEXPORT jstring JNICALL
