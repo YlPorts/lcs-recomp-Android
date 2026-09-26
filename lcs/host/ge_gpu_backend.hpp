@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -138,6 +139,39 @@ struct GeGpuVertex {
     float q{1.0f};
     std::uint32_t transform_control{};
 };
+
+
+#if defined(__ANDROID__)
+struct GeGpuClipViewport {
+    std::int32_t x{}, y{}, width{}, height{}; // PSP top-left pixel coordinates
+    float near_depth{}, far_depth{};
+    bool cull_enabled{};
+    bool accept_counter_clockwise{};
+    bool flat_shading{};
+    bool operator==(const GeGpuClipViewport &) const = default;
+};
+// Conservative eligibility: use the established CPU route for subpixel or
+// unusual PSP viewport/depth modes rather than approximate their semantics.
+inline bool build_ge_gpu_clip_viewport(float sx,float sy,float sz,
+                                       float cx,float cy,float cz,
+                                       bool depth_clip, GeGpuClipViewport &out) noexcept {
+    if (!depth_clip || !(sx > 0.0f) || !(sy < 0.0f) ||
+        !std::isfinite(sx+sy+sz+cx+cy+cz)) return false;
+    const float v[4]{cx-sx,cy+sy,2.0f*sx,-2.0f*sy};
+    for (float f:v) if (std::abs(f)>16384.0f || std::abs(f-std::round(f))>0.0001f) return false;
+    const float near=(cz-sz)/65535.0f,far=(cz+sz)/65535.0f;
+    if (near<0.0f || near>1.0f || far<0.0f || far>1.0f) return false;
+    out.x=static_cast<std::int32_t>(std::round(v[0]));
+    out.y=static_cast<std::int32_t>(std::round(v[1]));
+    out.width=static_cast<std::int32_t>(std::round(v[2]));
+    out.height=static_cast<std::int32_t>(std::round(v[3]));
+    out.near_depth=near;out.far_depth=far;
+    return out.width>0 && out.height>0;
+}
+// Returns false without consuming the draw if this optional GLES path is off.
+bool ge_gpu_backend_accumulate_clip_vertices(const GeGpuDrawDescriptor &,
+    const GeGpuClipViewport &,std::span<const GeGpuVertex>) noexcept;
+#endif
 
 struct GeGpuDecodedMipLevel {
     std::uint32_t width{};

@@ -156,6 +156,7 @@ Java_com_ylports_lcsrecomp_MainActivity_nativeRun(
     setenv("PSPRECOMP_GE_GPU_HW_TRANSFORM", "0", 1);
     setenv("PSPRECOMP_GE_DIRECT_NONINDEXED_DRAW", "1", 1);
     setenv("PSPRECOMP_GLES_SCALE", "1", 1);
+    setenv("PSPRECOMP_GLES_CLIP", "1", 1);
     // LCS_FPS_CAP throttles changing GE LIST addresses, not finished frames.
     // A game frame contains several lists; keep only the existing vblank
     // real-time pacing instead of sleeping 16.67 ms per list as well.
@@ -165,9 +166,9 @@ Java_com_ylports_lcsrecomp_MainActivity_nativeRun(
     setenv("PSPRECOMP_INTERNAL_HEIGHT", "272", 1);
     setenv("PSPRECOMP_AUDIO", "1", 1);
 
-    // FFmpeg/PMF decoding is not linked in the Android bootstrap yet. Tell the
-    // HLE to reject MPEG creation immediately so startup movies are skipped
-    // instead of repeatedly waiting on a decoder that can never produce a frame.
+    // ATRAC3/ATRAC3+ streams now use FFmpeg. Keep the separate PMF movie path
+    // skipped: CPU video-frame upload into an EGL-owned Surface needs its own
+    // tested path. Real-time cutscene voice streams are not affected by this flag.
     setenv("LCS_SKIP_MPEG", "1", 1);
 
     // EGL contexts are thread-affine. The first GLES build let the GE worker

@@ -48,7 +48,6 @@ target_compile_definitions(lcs_generated PRIVATE
 file(GLOB LCS_HOST CONFIGURE_DEPENDS "${REPO_ROOT}/lcs/host/*.cpp")
 list(REMOVE_ITEM LCS_HOST
     "${REPO_ROOT}/lcs/host/display_window.cpp"
-    "${REPO_ROOT}/lcs/host/lcs_media_decoder.cpp"
     "${REPO_ROOT}/lcs/host/main.cpp"
 )
 
@@ -70,7 +69,6 @@ add_library(lcsrecomp SHARED
     "${CMAKE_CURRENT_LIST_DIR}/android_bridge.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/android_debug.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/display_window_android.cpp"
-    "${CMAKE_CURRENT_LIST_DIR}/lcs_media_decoder_stub.cpp"
     $<TARGET_OBJECTS:lcs_main_obj>
 )
 
@@ -109,3 +107,17 @@ target_link_libraries(lcsrecomp PRIVATE
     ${GLES_LIB}
     ${AAUDIO_LIB}
 )
+
+# These are ordinary replaceable LGPL shared libraries, built from the exact
+# source pin by android/tools/build_ffmpeg.sh. No copyrighted game media bundled.
+set(FFMPEG_ROOT "${REPO_ROOT}/android/.deps/ffmpeg-android" CACHE PATH "Android FFmpeg prefix")
+foreach(component avcodec avformat avutil swresample swscale)
+    if(NOT EXISTS "${FFMPEG_ROOT}/lib/lib${component}.so")
+        message(FATAL_ERROR "Run bash android/tools/build_ffmpeg.sh android before building the APK")
+    endif()
+    add_library(ffmpeg_${component} SHARED IMPORTED)
+    set_target_properties(ffmpeg_${component} PROPERTIES
+        IMPORTED_LOCATION "${FFMPEG_ROOT}/lib/lib${component}.so"
+        INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_ROOT}/include")
+    target_link_libraries(lcsrecomp PRIVATE ffmpeg_${component})
+endforeach()

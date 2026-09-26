@@ -4,3 +4,7 @@
 /lcs/progress/
 .vs/
 .vscode/
+
+# Native codec dependency build trees
+android/.deps/
+android/test-results/

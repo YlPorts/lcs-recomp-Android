@@ -67,6 +67,8 @@ struct GlesBatch {
     std::uint32_t first_vertex{};
     std::uint32_t first_index{};
     bool hardware_transform{};
+    bool clip_coordinates{};
+    GeGpuClipViewport clip_viewport{};
     GeGpuHardwareTransform transform{};
 };
 
@@ -90,6 +92,8 @@ struct GlesState {
     std::uint64_t perf_presents{};
     std::uint64_t perf_epochs{};
     std::uint64_t perf_color_tests{};
+    std::uint64_t perf_clip_draws{};
+    std::uint64_t perf_clip_vertices{};
 
     std::mutex window_mutex;
     ANativeWindow *window{};
@@ -108,6 +112,8 @@ struct GlesState {
     GLuint present_vao{};
 
     GLint u_mode{-1};
+    GLint u_flat_shading{-1};
+    int vertex_mode_cache{-1};
     GLint u_logical_size{-1};
     GLint u_row0{-1};
     GLint u_row1{-1};
@@ -314,12 +320,17 @@ uniform vec4 uVertexColorAdd;
 uniform int uVertexColorAffine;
 
 out vec4 vColor;
+flat out vec4 vFlatColor;
 out vec2 vUv;
 out float vFogFactor;
 out float vQ;
 
 void main() {
-    if (uMode == 1) {
+    if (uMode == 3) {
+        gl_Position = aPosition;
+        vUv = aUv;
+        vFogFactor = aFogFactor;
+    } else if (uMode == 1) {
         vec4 p = aPosition;
         float clipW = dot(uRow3, p);
         if (abs(clipW) < 1.0e-12) clipW = 1.0;
@@ -346,6 +357,7 @@ void main() {
     vColor = aColor;
     if (uVertexColorAffine != 0)
         vColor = floor(clamp(vColor * uVertexColorMul + uVertexColorAdd, 0.0, 1.0) * 255.0) / 255.0;
+    vFlatColor = vColor;
     vQ = aQ;
 }
 )GLSL";
@@ -375,6 +387,8 @@ uniform vec3 uFogColor;
 uniform int uFramebufferFormat;
 
 in vec4 vColor;
+flat in vec4 vFlatColor;
+uniform int uFlatShading;
 in vec2 vUv;
 in float vFogFactor;
 in float vQ;
@@ -396,7 +410,7 @@ float quantize(float value, float levels) {
 }
 
 void main() {
-    vec4 color = clamp(vColor, 0.0, 1.0);
+    vec4 color = clamp(uFlatShading != 0 ? vFlatColor : vColor, 0.0, 1.0);
     if (uTextureEnabled != 0) {
         float q = abs(vQ) < 1.0e-20 ? 1.0 : vQ;
         vec2 sampleUv = vUv / q;
@@ -517,6 +531,7 @@ void main() {
     glBindVertexArray(0);
 
     s.u_mode = glGetUniformLocation(s.program, "uMode");
+    s.u_flat_shading = glGetUniformLocation(s.program, "uFlatShading");
     s.u_logical_size = glGetUniformLocation(s.program, "uLogicalSize");
     s.u_row0 = glGetUniformLocation(s.program, "uRow0");
     s.u_row1 = glGetUniformLocation(s.program, "uRow1");
@@ -961,6 +976,17 @@ std::array<float, 4> add_scaled(const std::array<float, 4> &a, float sa,
 void set_transform_uniforms(
     GlesState &s, const GlesBatch &batch,
     std::uint32_t logical_width, std::uint32_t logical_height) {
+    glUniform1i(s.u_flat_shading, batch.clip_coordinates && batch.clip_viewport.flat_shading);
+    if (batch.clip_coordinates) {
+        if (s.vertex_mode_cache != 3) {
+            glUniform1i(s.u_mode,3);
+            glUniform1i(s.u_vertex_color_affine,0);
+        }
+        s.vertex_mode_cache=3;
+        s.cpu_transform_uniform_valid=false;
+        return;
+    }
+    s.vertex_mode_cache=batch.hardware_transform ? 1 : 2;
     if (!batch.hardware_transform && s.cpu_transform_uniform_valid &&
         s.uniform_width==logical_width && s.uniform_height==logical_height) return;
     s.cpu_transform_uniform_valid=!batch.hardware_transform;
@@ -1208,7 +1234,23 @@ bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
               right - left, bottom - top);
 
     apply_draw_state(batch.draw);
-    glDisable(GL_CULL_FACE);
+    if (batch.clip_coordinates) {
+        const auto &vp=batch.clip_viewport;
+        const float scale_x=static_cast<float>(target.render_width)/logical_width;
+        const float scale_y=static_cast<float>(target.render_height)/logical_height;
+        glViewport(static_cast<GLint>(std::lround(vp.x*scale_x)),
+            static_cast<GLint>(target.render_height)-static_cast<GLint>(std::lround((vp.y+vp.height)*scale_y)),
+            static_cast<GLsizei>(std::lround(vp.width*scale_x)),
+            static_cast<GLsizei>(std::lround(vp.height*scale_y)));
+        glDepthRangef(vp.near_depth,vp.far_depth);
+        if (vp.cull_enabled) {
+            glEnable(GL_CULL_FACE);glCullFace(GL_BACK);
+            glFrontFace(vp.accept_counter_clockwise ? GL_CW : GL_CCW);
+        } else glDisable(GL_CULL_FACE);
+    } else {
+        glDepthRangef(0.0f,1.0f);
+        glDisable(GL_CULL_FACE);
+    }
 
     glUseProgram(s.program);
     set_transform_uniforms(s, batch, logical_width, logical_height);
@@ -1222,7 +1264,8 @@ bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
 
     glBindVertexArray(s.vao);
 
-    GLenum mode = GL_TRIANGLES;
+    GLenum mode = batch.clip_coordinates && batch.draw.primitive==4u ? GL_TRIANGLE_STRIP :
+        (batch.clip_coordinates && batch.draw.primitive==5u ? GL_TRIANGLE_FAN : GL_TRIANGLES);
     if (batch.hardware_transform && batch.transform.primitive == 4u &&
         batch.indices.empty())
         mode = GL_TRIANGLE_STRIP;
@@ -1248,6 +1291,7 @@ bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
         : (mode == GL_TRIANGLE_STRIP
             ? (batch.indices.size() > 2u ? batch.indices.size() - 2u : 0u)
             : batch.indices.size() / 3u);
+    if (batch.clip_coordinates) { ++s.perf_clip_draws; s.perf_clip_vertices+=batch.vertices.size(); }
     if (batch.draw.color_test_enabled) ++s.perf_color_tests;
     if (textured) ++s.report.textured_game_draw_calls;
     if (batch.draw.depth_test_enabled) ++s.report.depth_tested_game_draw_calls;
@@ -1761,6 +1805,37 @@ bool gles_draw_state_compatible(
            a.clear_depth == b.clear_depth;
 }
 
+
+bool ge_gpu_backend_accumulate_clip_vertices(const GeGpuDrawDescriptor &input_draw,
+    const GeGpuClipViewport &viewport,std::span<const GeGpuVertex> vertices) noexcept {
+    auto &s=state();
+    const char *setting=std::getenv("PSPRECOMP_GLES_CLIP");
+    if (!s.enabled || (setting && std::strcmp(setting,"0")==0) || vertices.empty()) return false;
+    const auto draw=snapshot_texture_draw(input_draw);
+    if (draw.primitive<3u || draw.primitive>5u || draw.through || draw.clear_mode) return false;
+    try {
+        GlesBatch batch{};
+        batch.draw=draw;batch.clip_coordinates=true;batch.clip_viewport=viewport;
+        batch.vertices.assign(vertices.begin(),vertices.end());
+        if (draw.texture_enabled && draw.texture_width && draw.texture_height) {
+            const float iw=1.0f/draw.texture_width,ih=1.0f/draw.texture_height;
+            for (auto &v:batch.vertices) { v.u*=iw;v.v*=ih; }
+        }
+        // Merge independent triangle lists only. Strips/fans require explicit
+        // boundaries; concatenation would invent bridging triangles.
+        if (draw.primitive==3u && !s.batches.empty()) {
+            auto &last=s.batches.back();
+            if (last.clip_coordinates && last.draw.primitive==3u &&
+                last.clip_viewport==viewport && gles_draw_state_compatible(last.draw,draw)) {
+                last.vertices.insert(last.vertices.end(),batch.vertices.begin(),batch.vertices.end());
+                return true;
+            }
+        }
+        s.batches.push_back(std::move(batch));
+        return true;
+    } catch (...) { return false; }
+}
+
 bool append_or_merge_color_batch(
     GlesState &s,
     const GeGpuDrawDescriptor &input_draw,
@@ -1788,7 +1863,7 @@ bool append_or_merge_color_batch(
 
     if (!s.batches.empty()) {
         GlesBatch &last = s.batches.back();
-        if (!last.hardware_transform && last.indices.empty() &&
+        if (!last.hardware_transform && !last.clip_coordinates && last.indices.empty() &&
             gles_draw_state_compatible(last.draw, draw)) {
             try {
                 append_vertices(last.vertices);
@@ -1981,7 +2056,10 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
             " presentCalls=" + std::to_string(s.perf_presents) +
             " finishCalls=" + std::to_string(s.perf_epochs) +
             " wallSec=" + std::to_string(wall_s) +
-            " colorTestDraws=" + std::to_string(s.perf_color_tests));
+            " colorTestDraws=" + std::to_string(s.perf_color_tests)+
+            " gpuClipDraws="+std::to_string(s.perf_clip_draws)+
+            " gpuClipVertices="+std::to_string(s.perf_clip_vertices));
+        s.perf_clip_draws=s.perf_clip_vertices=0;
         s.perf_presents = s.perf_epochs = s.perf_color_tests = 0;
         s.perf_window = perf_now;
     }

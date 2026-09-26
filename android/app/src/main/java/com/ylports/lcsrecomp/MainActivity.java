@@ -135,7 +135,7 @@ public final class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView info = new TextView(this);
-        info.setText("v0.6.9 · Audio + frame stability\nGTA: Liberty City Stories · ULUS-10041 v1.05");
+        info.setText("v0.6.10 · Audio + frame stability\nGTA: Liberty City Stories · ULUS-10041 v1.05");
         info.setTextColor(Color.LTGRAY);
         info.setTextSize(15f);
         info.setGravity(Gravity.CENTER);

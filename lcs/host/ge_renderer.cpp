@@ -929,7 +929,35 @@ GeGpuHardwareTransform build_gpu_hardware_transform(
     return hw;
 }
 
-Vec3 read_vector3(const psprecomp::GuestMemory &memory, std::uint32_t address,
+
+// Only used after raw_pointer has validated the complete vertex record.
+// Scalar reads are memcpy-based: no host alignment or strict-aliasing assumptions.
+struct VertexByteView {
+    const std::uint8_t *data{};
+    std::size_t size{};
+    bool contains(std::uint32_t offset, std::size_t bytes) const noexcept {
+        return offset <= size && bytes <= size - offset;
+    }
+    const std::uint8_t *raw_pointer(std::uint32_t offset, std::size_t bytes) const noexcept {
+        return contains(offset, bytes) ? data + offset : nullptr;
+    }
+    std::uint8_t aot_load8(std::uint32_t offset) const noexcept { return data[offset]; }
+    std::uint16_t aot_load16(std::uint32_t offset) const noexcept {
+        return static_cast<std::uint16_t>(data[offset]) |
+               (static_cast<std::uint16_t>(data[offset + 1]) << 8u);
+    }
+    std::uint32_t aot_load32(std::uint32_t offset) const noexcept {
+        std::uint32_t value;
+        std::memcpy(&value, data + offset, sizeof(value));
+        if constexpr (std::endian::native == std::endian::big)
+            value = ((value & 255u) << 24u) | ((value & 0xff00u) << 8u) |
+                    ((value >> 8u) & 0xff00u) | (value >> 24u);
+        return value;
+    }
+};
+
+template <typename VertexMemory>
+Vec3 read_vector3(const VertexMemory &memory, std::uint32_t address,
                   std::uint32_t format) {
     switch (format) {
     case 1u:
@@ -949,7 +977,8 @@ Vec3 read_vector3(const psprecomp::GuestMemory &memory, std::uint32_t address,
     }
 }
 
-void read_texcoord(const psprecomp::GuestMemory &memory, std::uint32_t address,
+template <typename VertexMemory>
+void read_texcoord(const VertexMemory &memory, std::uint32_t address,
                    std::uint32_t format, bool through, float &u, float &v) {
     switch (format) {
     case 0u: u = v = 0.0f; break;
@@ -970,7 +999,8 @@ void read_texcoord(const psprecomp::GuestMemory &memory, std::uint32_t address,
     }
 }
 
-Color read_vertex_color(const psprecomp::GuestMemory &memory, std::uint32_t address,
+template <typename VertexMemory>
+Color read_vertex_color(const VertexMemory &memory, std::uint32_t address,
                         std::uint32_t format) {
     switch (format) {
     case 4u: return unpack16(memory.aot_load16(address), 0u);
@@ -995,7 +1025,8 @@ Color material_ambient_color(const std::array<std::uint32_t, 256> &commands) noe
     };
 }
 
-Color morph_color(const psprecomp::GuestMemory &memory, std::uint32_t address,
+template <typename VertexMemory>
+Color morph_color(const VertexMemory &memory, std::uint32_t address,
                   const VertexLayout &layout, const GeTransformState &transform,
                   const std::array<std::uint32_t, 256> &commands) {
     if (layout.color_type < 4u) return material_ambient_color(commands);
@@ -1012,7 +1043,8 @@ Color morph_color(const psprecomp::GuestMemory &memory, std::uint32_t address,
     return {clamp_channel(r), clamp_channel(g), clamp_channel(b), clamp_channel(a)};
 }
 
-std::array<float, 12> compute_skin_matrix(const psprecomp::GuestMemory &memory,
+template <typename VertexMemory>
+std::array<float, 12> compute_skin_matrix(const VertexMemory &memory,
                                           std::uint32_t address,
                                           const VertexLayout &layout,
                                           const GeTransformState &transform) {
@@ -1277,7 +1309,8 @@ bool prepare_directional_lighting_affine(const PreparedLighting &state,
     return true;
 }
 
-bool decode_vertex(const psprecomp::GuestMemory &memory, std::uint32_t address,
+template <typename VertexMemory>
+bool decode_vertex(const VertexMemory &memory, std::uint32_t address,
                    const VertexLayout &layout,
                    const std::array<std::uint32_t, 256> &commands,
                    const GeTransformState &transform,
@@ -1431,7 +1464,8 @@ bool decode_vertex(const psprecomp::GuestMemory &memory, std::uint32_t address,
     return true;
 }
 
-bool decode_vertex_0115_fast(const psprecomp::GuestMemory &memory, std::uint32_t address,
+template <typename VertexMemory>
+bool decode_vertex_0115_fast(const VertexMemory &memory, std::uint32_t address,
                              const VertexLayout &layout,
                              const std::array<std::uint32_t, 256> &commands,
                              const GeTransformState &transform,
@@ -1478,7 +1512,8 @@ bool decode_vertex_0115_fast(const psprecomp::GuestMemory &memory, std::uint32_t
     return true;
 }
 
-bool decode_vertex_optimized(const psprecomp::GuestMemory &memory, std::uint32_t address,
+template <typename VertexMemory>
+bool decode_vertex_optimized(const VertexMemory &memory, std::uint32_t address,
                              const VertexLayout &layout,
                              const std::array<std::uint32_t, 256> &commands,
                              const GeTransformState &transform,
@@ -4595,6 +4630,9 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         const bool reuse_indexed = gpu_backend_enabled && layout.index_type != 0u;
         // Material/light state is identical for all vertices in this primitive.
         const PreparedLighting primitive_lighting = prepare_lighting(layout.color_type >= 4u, commands);
+#if defined(__ANDROID__)
+        const float primitive_x_scale = layout.through ? 1.0f : android_ultrawide_x_scale();
+#endif
         for (std::uint32_t i = 0u; i < count; ++i) {
             const std::uint32_t index = draw_indices(i);
             const auto slot = index & 255u;
@@ -4606,14 +4644,22 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
                 continue;
             }
             Vertex vertex{};
-            if (!decode_vertex_optimized(memory, vertex_address + index * layout.stride, layout,
+            const std::uint64_t source_address = static_cast<std::uint64_t>(vertex_address) +
+                static_cast<std::uint64_t>(index) * layout.stride;
+            if (source_address > 0xFFFFFFFFull) { error = "GE vertex address overflow"; return false; }
+            const std::uint8_t *record = memory.raw_pointer(
+                static_cast<std::uint32_t>(source_address), layout.stride);
+            if (record == nullptr) { error = "GE vertex record outside guest memory"; return false; }
+            const VertexByteView record_view{record, layout.stride};
+            if (!decode_vertex_optimized(record_view, 0u, layout,
                                          commands, transform, vertex, error, &primitive_lighting)) return false;
 #if defined(__ANDROID__)
             // SurfaceFlinger stretches the low-resolution producer buffer to the
             // physical ultrawide display. Compress 3D clip X by the inverse
             // aspect stretch so the result gains horizontal FOV instead of
             // making characters/cars look fat.
-            if (!layout.through) apply_android_3d_ultrawide(vertex);
+            if (!layout.through && std::abs(primitive_x_scale - 1.0f) >= 0.001f)
+                vertex.x *= primitive_x_scale;
 #endif
             if (reuse_indexed) {
                 reuse_vertices[slot] = vertex;
@@ -4718,6 +4764,45 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         }
         (void)ge_gpu_backend_stage_vertices(gpu_draw, gpu_vertices);
     }
+
+#if defined(__ANDROID__)
+    // Keep the proven CPU model/lighting calculations, but let GLES perform
+    // homogeneous clipping, perspective division and primitive assembly.
+    if (gpu_only_triangle_path && !layout.through && !setup.clear_mode &&
+        primitive >= 3u && primitive <= 5u) {
+        PhaseTimer prep_timer(g_ge_triangle_prep_ns);
+        GeGpuClipViewport viewport{};
+        const float sx = decode_float24(data24(commands[0x42u]));
+        const float sy = decode_float24(data24(commands[0x43u]));
+        const float sz = decode_float24(data24(commands[0x44u]));
+        const float cx = decode_float24(data24(commands[0x45u])) -
+            static_cast<float>(data24(commands[0x4Cu]) & 0xFFFFu) / 16.0f;
+        const float cy = decode_float24(data24(commands[0x46u])) -
+            static_cast<float>(data24(commands[0x4Du]) & 0xFFFFu) / 16.0f;
+        const float cz = decode_float24(data24(commands[0x47u]));
+        const bool depth_clip = (data24(commands[0x1Cu]) & 1u) != 0u;
+        if (build_ge_gpu_clip_viewport(sx,sy,sz,cx,cy,cz,depth_clip,viewport)) {
+            viewport.cull_enabled = (data24(commands[0x1Du]) & 1u) != 0u;
+            viewport.accept_counter_clockwise = (data24(commands[0x9Bu]) & 1u) != 0u;
+            viewport.flat_shading = (data24(commands[0x50u]) & 1u) == 0u;
+            static thread_local std::vector<GeGpuVertex> clip_vertices;
+            clip_vertices.clear(); clip_vertices.reserve(vertices.size());
+            bool finite = true;
+            for (const auto &v : vertices) {
+                finite &= finite_float(v.x) && finite_float(v.y) && finite_float(v.z) && finite_float(v.w);
+                GeGpuVertex out{};
+                out.x=v.x;out.y=v.y;out.z=v.z;out.w=v.w;
+                out.rgba=pack_gpu_color(v.color);out.u=v.u;out.v=v.v;
+                out.fog_factor=v.fog_factor;out.q=v.q;
+                clip_vertices.push_back(out);
+            }
+            if (finite && ge_gpu_backend_accumulate_clip_vertices(gpu_draw,viewport,clip_vertices)) {
+                advance_stream();
+                return true;
+            }
+        }
+    }
+#endif
 
     switch (primitive) {
     case 0u:

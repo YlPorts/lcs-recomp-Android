@@ -1,4 +1,5 @@
 #include "lcs_media_decoder.hpp"
+#include "lcs_runtime_log.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -41,19 +42,32 @@ struct DecodeCommon {
 
     [[nodiscard]] bool open_stream(const std::filesystem::path &path, AVMediaType type) {
         release();
-        if (avformat_open_input(&format, path.string().c_str(), nullptr, nullptr) < 0) return false;
-        if (avformat_find_stream_info(format, nullptr) < 0) return false;
+        const auto fail = [&](const char *stage) {
+            runtime_log_line(std::string("media: open failed stage=") + stage +
+                             " file=" + path.filename().string());
+            release();
+            return false;
+        };
+        if (avformat_open_input(&format, path.string().c_str(), nullptr, nullptr) < 0)
+            return fail("container");
+        if (avformat_find_stream_info(format, nullptr) < 0) return fail("stream-info");
         const AVCodec *decoder = nullptr;
         stream_index = av_find_best_stream(format, type, -1, -1, &decoder, 0);
-        if (stream_index < 0 || decoder == nullptr) return false;
+        if (stream_index < 0 || decoder == nullptr) return fail("codec");
         codec = avcodec_alloc_context3(decoder);
-        if (codec == nullptr) return false;
+        if (codec == nullptr) return fail("allocate-codec");
         if (avcodec_parameters_to_context(codec, format->streams[stream_index]->codecpar) < 0)
-            return false;
-        if (avcodec_open2(codec, decoder, nullptr) < 0) return false;
+            return fail("codec-parameters");
+        codec->thread_count = 1; // bounded memory and deterministic audio latency
+        if (avcodec_open2(codec, decoder, nullptr) < 0) return fail("open-codec");
         packet = av_packet_alloc();
         frame = av_frame_alloc();
-        return packet != nullptr && frame != nullptr;
+        if (!packet || !frame) return fail("allocate-packets");
+        runtime_log_line(std::string("media: opened codec=") + decoder->name +
+                         " rate=" + std::to_string(codec->sample_rate) +
+                         " channels=" + std::to_string(codec->ch_layout.nb_channels) +
+                         " file=" + path.filename().string());
+        return true;
     }
 
     template <typename Consume>
@@ -118,6 +132,7 @@ struct AudioStreamDecoder::State {
     SwrContext *resampler{};
     std::uint32_t sample_rate{};
     std::uint32_t channels{};
+    bool ready{};
 
     ~State() {
         if (resampler != nullptr) swr_free(&resampler);
@@ -129,9 +144,11 @@ AudioStreamDecoder::~AudioStreamDecoder() = default;
 AudioStreamDecoder::AudioStreamDecoder(AudioStreamDecoder &&) noexcept = default;
 AudioStreamDecoder &AudioStreamDecoder::operator=(AudioStreamDecoder &&) noexcept = default;
 
-bool AudioStreamDecoder::is_open() const noexcept { return state_->common.codec != nullptr; }
+bool AudioStreamDecoder::is_open() const noexcept { return state_ && state_->ready; }
 
 void AudioStreamDecoder::close() noexcept {
+    if (!state_) return;
+    state_->ready = false;
     if (state_->resampler != nullptr) swr_free(&state_->resampler);
     state_->common.release();
 }
@@ -166,6 +183,7 @@ bool AudioStreamDecoder::open(const std::filesystem::path &path, std::uint32_t s
             avcodec_flush_buffers(state_->common.codec);
         }
     }
+    state_->ready = true;
     return true;
 }
 

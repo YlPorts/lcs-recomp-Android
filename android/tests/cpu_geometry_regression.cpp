@@ -59,4 +59,5 @@ int main(){
         for(std::size_t i=0;i<fast.size();i++){same(fast[i].a,reference[i].a);same(fast[i].b,reference[i].b);same(fast[i].c,reference[i].c);}
     }
     std::cout<<"PASS: 10000 triangles match original polygon clipping\n";
+    return 0;
 }
