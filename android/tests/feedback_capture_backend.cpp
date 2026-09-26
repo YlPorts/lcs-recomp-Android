@@ -58,6 +58,7 @@ int main(int argc,char**argv){
     const auto reference=read_target(s,source.framebuffer_address);
     auto copy=source;copy.framebuffer_address=0x041b0000;copy.texture_address=source.framebuffer_address;
     copy.texture_enabled=true;copy.texture_width=32;copy.texture_height=32;copy.texture_function=3;
+    copy.texture_format=source.framebuffer_format; // This is an extent test, not a pixel-format reinterpretation.
     copy.texture_buffer_width=16;copy.texture_use_alpha=true;copy.texture_clamp_u=true;copy.texture_clamp_v=true;
     // Public accumulation normalizes PSP texel coordinates by the declared
     // texture extent; the shader must then map them to the 16x16 target.

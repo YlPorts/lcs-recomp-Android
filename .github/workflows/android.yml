@@ -32,7 +32,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Verify direct 0.6.16 source
+      - name: Verify direct 0.6.17 source
         run: |
           python3 android/tests/scale_config_regression.py
           python3 android/tests/capture_ui_contract.py
@@ -59,6 +59,13 @@ jobs:
         run: |
           g++ -std=c++20 -O2 -ffunction-sections -fdata-sections -Iinclude -Ilcs/host android/tests/lighting_cache_regression.cpp src/guest_memory.cpp -Wl,--gc-sections -pthread lcs/host/lcs_render_capture.cpp -o /tmp/lighting-cache
           /tmp/lighting-cache | tee android/test-results/lighting-cache.txt
+      - name: Ambient vertex fast path regression
+        run: |
+          set -euo pipefail
+          g++ -std=c++20 -O3 -ffp-contract=fast -ffunction-sections -fdata-sections -Iinclude -Ilcs/host android/tests/ambient_vertex_regression.cpp src/guest_memory.cpp -Wl,--gc-sections -pthread -o /tmp/ambient-vertex
+          /tmp/ambient-vertex | tee android/test-results/ambient-vertex.txt
+          g++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -ffunction-sections -fdata-sections -Iinclude -Ilcs/host android/tests/ambient_vertex_regression.cpp src/guest_memory.cpp -Wl,--gc-sections -pthread -o /tmp/ambient-vertex-san
+          /tmp/ambient-vertex-san | tee android/test-results/ambient-vertex-sanitized.txt
       - name: GE command state and record reuse regressions
         run: |
           set -euo pipefail
@@ -163,6 +170,18 @@ jobs:
           g++ -std=c++20 -O2 -D__ANDROID__ -Iandroid/tests/shim -Iandroid/app/src/main/cpp -Ilcs/host android/tests/gles_present_regression.cpp lcs/host/lcs_android_build.cpp lcs/host/lcs_render_capture.cpp -pthread -lEGL -lGLESv2 -o /tmp/gles-present
           /tmp/gles-present | tee android/test-results/gles-present.txt
           PSPRECOMP_GLES_FB_FETCH=0 /tmp/gles-present | tee android/test-results/gles-present-copy.txt
+      - name: Vehicle reflection framebuffer regression
+        run: |
+          set -euo pipefail
+          FLAGS="-std=c++20 -O2 -D__ANDROID__ -Iandroid/tests/shim -Iandroid/app/src/main/cpp -Ilcs/host"
+          g++ $FLAGS android/tests/gles_vehicle_feedback_regression.cpp lcs/host/lcs_android_build.cpp lcs/host/lcs_render_capture.cpp -pthread -lEGL -lGLESv2 -o /tmp/vehicle-feedback
+          /tmp/vehicle-feedback | tee android/test-results/vehicle-feedback-fetch.txt
+          PSPRECOMP_GLES_FB_FETCH=0 /tmp/vehicle-feedback | tee android/test-results/vehicle-feedback-copy.txt
+          git show 4bfcfee69084755a08150dc56ebd7fd210e230c4:lcs/host/ge_gpu_backend_gles.cpp > /tmp/gles-vehicle-before.cpp
+          g++ $FLAGS -DLCS_BASELINE_TEST '-DLCS_GLES_SOURCE="/tmp/gles-vehicle-before.cpp"' android/tests/gles_vehicle_feedback_regression.cpp lcs/host/lcs_android_build.cpp lcs/host/lcs_render_capture.cpp -pthread -lEGL -lGLESv2 -o /tmp/vehicle-feedback-before
+          baseline_status=0
+          /tmp/vehicle-feedback-before > android/test-results/vehicle-feedback-before.txt 2>&1 || baseline_status=$?
+          if [ "$baseline_status" -ne 20 ]; then cat android/test-results/vehicle-feedback-before.txt; echo "Expected the 0.6.16 stale-green reproduction"; exit 1; fi
       - name: Validate shader sources
         run: |
           python3 - <<'PY'
@@ -188,14 +207,14 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD > android/test-results/source-commit.txt
-          git archive --format=tar.gz -o /tmp/LCSRecomp-Android-0.6.16-source.tar.gz HEAD
+          git archive --format=tar.gz -o /tmp/LCSRecomp-Android-0.6.17-source.tar.gz HEAD
           git -C android/.deps/ffmpeg-source archive --prefix=FFmpeg-7.1.5/ --format=tar.gz -o /tmp/LCS-FFmpeg-7.1.5-source.tar.gz HEAD
       - name: Upload source and tests
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.16-source-and-tests
+          name: LCSRecomp-Android-0.6.17-source-and-tests
           path: |
-            /tmp/LCSRecomp-Android-0.6.16-source.tar.gz
+            /tmp/LCSRecomp-Android-0.6.17-source.tar.gz
             /tmp/LCS-FFmpeg-7.1.5-source.tar.gz
             android/test-results/
       - name: Java 17
@@ -257,7 +276,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.16-arm64-debug
+          name: LCSRecomp-Android-0.6.17-arm64-debug
           path: |
             android/app/build/outputs/apk/debug/app-debug.apk
             android/app/build/outputs/apk/debug/app-debug.apk.sha256
@@ -267,5 +286,5 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.16-failed-test-results
+          name: LCSRecomp-Android-0.6.17-failed-test-results
           path: android/test-results/

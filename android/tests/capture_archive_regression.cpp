@@ -24,11 +24,18 @@ int main(int argc,char **argv){
     for(int i=0;i<70;++i)render_capture_bytes("data_"+std::to_string(i),chunk);
     render_capture_finish();assert(render_capture_status()==3);
     assert(std::filesystem::file_size(dir+"/limited.zip")<65u*1024u*1024u);
+    // A real busy frame exceeded the old 16000-entry limit before its vehicle
+    // GPU batches were recorded. Keep such a frame while bounding ZIP entries.
+    for (const auto &item : {std::pair{"dense",22000},std::pair{"entries",33000}}) {
+        assert(render_capture_request(dir+"/"+item.first+".zip"));render_capture_frame_boundary();
+        for(int i=0;i<item.second;++i)render_capture_bytes("draw_"+std::to_string(i),{});
+        render_capture_finish();assert(render_capture_status()==3);
+    }
     assert(render_capture_request(dir+"/marked.zip"));render_capture_frame_boundary();
     render_capture_incomplete();render_capture_finish();assert(render_capture_status()==3);
     assert(render_capture_request(dir+"/no-directory/no.zip"));render_capture_frame_boundary();
     assert(render_capture_status()==-1);
     assert(render_capture_request(dir+"/cancelled.zip"));render_capture_finish();
     assert(render_capture_status()==-1 && !std::filesystem::exists(dir+"/cancelled.zip"));
-    std::cout<<"PASS: explicit request, whole-frame boundaries, concurrent request rejection, binary/empty entries, 64 MiB bound, partial marker, atomic finalization and I/O failure\n";
+    std::cout<<"PASS: explicit request, whole-frame boundaries, concurrent request rejection, binary/empty entries, 64 MiB and 32000-entry bounds, dense-frame capture, partial marker, atomic finalization and I/O failure\n";
 }

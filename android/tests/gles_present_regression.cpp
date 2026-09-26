@@ -68,4 +68,5 @@ int main() {
     assert(glGetError() == GL_NO_ERROR);
     std::cout << "PASS: actual GLES window pixels survive both preceding game-draw culling directions\n";
     destroy_backend(s);
+    return 0;
 }

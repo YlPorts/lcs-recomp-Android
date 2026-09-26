@@ -1386,6 +1386,44 @@ public:
     }
 };
 
+// With no enabled individual lights, the ambient/emissive result depends only
+// on the vertex colour and material state. The normal and position cannot alter
+// it. Keep the reference arithmetic on misses and compare the complete colour
+// key, so collisions never substitute a different colour.
+class AmbientVertexColorCache {
+    struct Entry {
+        std::uint32_t key{};
+        Color output{};
+        std::uint64_t epoch{};
+    };
+    std::array<Entry,256> entries_{};
+    std::uint64_t epoch_{};
+    bool enabled_{};
+public:
+    void begin(const PreparedLighting &lighting) noexcept {
+        if (++epoch_ == 0u) { for (auto &entry:entries_) entry.epoch=0u; epoch_=1u; }
+        enabled_=lighting.enabled;
+        for (const auto &light:lighting.lights)
+            if (light.enabled) enabled_=false;
+    }
+    bool enabled() const noexcept { return enabled_; }
+    Color apply(Color input, const PreparedLighting &lighting) {
+        const auto key=std::bit_cast<std::uint32_t>(input);
+        auto &entry=entries_[((key^(key>>11u))*0x9e3779b9u)>>24u];
+        if (entry.epoch==epoch_ && entry.key==key) return entry.output;
+        entry.key=key; entry.epoch=epoch_;
+        entry.output=apply_prepared_lighting(input,{},Vec3{0.0f,0.0f,1.0f},lighting);
+        return entry.output;
+    }
+};
+
+bool ambient_0115_eligible(const VertexLayout &layout, std::uint32_t uv_generation,
+                           bool gpu_backend_enabled,
+                           const AmbientVertexColorCache &colors) noexcept {
+    return gpu_backend_enabled && layout.type==0x000115u && !layout.through &&
+        (uv_generation==0u || uv_generation==3u) && colors.enabled();
+}
+
 struct PreparedEnvironmentMap {
     Vec3 light_s{};
     Vec3 light_t{};
@@ -1599,6 +1637,19 @@ bool decode_vertex_0115_fast(const VertexMemory &memory, std::uint32_t address,
     const float offset_v = decode_float24(data24(commands[0x4Bu]));
     vertex.u = (vertex.u * scale_u + offset_u) * texture_width;
     vertex.v = (vertex.v * scale_v + offset_v) * texture_height;
+    return true;
+}
+
+template <typename VertexMemory>
+bool decode_vertex_0115_ambient_fast(const VertexMemory &memory, std::uint32_t address,
+                                    const VertexLayout &layout,
+                                    const std::array<std::uint32_t,256> &commands,
+                                    const GeTransformState &transform, Vertex &vertex,
+                                    std::string &error, const PreparedLighting &lighting,
+                                    AmbientVertexColorCache &colors) {
+    if (!decode_vertex_0115_fast(memory,address,layout,commands,transform,vertex,error))
+        return false;
+    vertex.color=colors.apply(vertex.color,lighting);
     return true;
 }
 
@@ -4179,6 +4230,13 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             gpu_draw.framebuffer_address = framebuffer_address(commands);
             gpu_draw.framebuffer_stride = data24(commands[0x9Du]) & 0x7FCu;
             gpu_draw.framebuffer_format = data24(commands[0xD2u]) & 3u;
+            const auto region1 = data24(commands[0x15u]);
+            const auto region2 = data24(commands[0x16u]);
+            gpu_draw.region_defined = commands[0x15u] != 0u || commands[0x16u] != 0u;
+            gpu_draw.region_x0 = static_cast<std::int32_t>(region1 & 0x3FFu);
+            gpu_draw.region_y0 = static_cast<std::int32_t>((region1 >> 10u) & 0x3FFu);
+            gpu_draw.region_x1 = static_cast<std::int32_t>(region2 & 0x3FFu);
+            gpu_draw.region_y1 = static_cast<std::int32_t>((region2 >> 10u) & 0x3FFu);
             gpu_draw.texture_format = data24(commands[0xC3u]) & 0xFu;
             gpu_draw.texture_selected_level=selected_texture_level(commands);
             for(std::uint32_t level=0;level<8;++level){gpu_draw.texture_level_addresses[level]=texture_address(commands,level);gpu_draw.texture_level_buffer_widths[level]=ge_texture_buffer_width(data24(commands[0xA8u+level]),gpu_draw.texture_format);const auto sz=data24(commands[0xB8u+level]);gpu_draw.texture_level_widths[level]=1u<<(sz&0xFu);gpu_draw.texture_level_heights[level]=1u<<((sz>>8u)&0xFu);}
@@ -4832,12 +4890,14 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         static thread_local std::uint64_t prepared_light_revision{};
         static thread_local bool prepared_vertex_color{};
         static thread_local VertexLightingCache primitive_light_cache;
+        static thread_local AmbientVertexColorCache primitive_ambient_cache;
         if (lighting_state_revision==0 || prepared_light_revision!=lighting_state_revision ||
             prepared_vertex_color!=(layout.color_type>=4u)) {
             primitive_lighting=prepare_lighting(layout.color_type>=4u,commands);
             prepared_light_revision=lighting_state_revision;
             prepared_vertex_color=layout.color_type>=4u;
             primitive_light_cache.begin(primitive_lighting);
+            primitive_ambient_cache.begin(primitive_lighting);
         }
         static thread_local GeVertexMemo<Vertex> primitive_vertex_cache;
         // Camera/vertex revision covers matrices, materials, lighting, morph,
@@ -4859,6 +4919,12 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         const bool environment_uv = !layout.through && uv_generation == 2u;
         const PreparedEnvironmentMap primitive_environment = environment_uv
             ? prepare_environment_map(commands) : PreparedEnvironmentMap{};
+        // Captured LCS scenery uses this exact 10-byte, unskinned layout with
+        // global lighting enabled but no individual lights. Reuse the existing
+        // position/fog/UV decoder and cache ambient colours; omit only normal
+        // work whose result cannot affect this guarded case.
+        const bool ambient_0115 = ambient_0115_eligible(
+            layout,uv_generation,gpu_backend_enabled,primitive_ambient_cache);
         for (std::uint32_t i = 0u; i < count; ++i) {
             const std::uint32_t index = draw_indices(i);
             const auto slot = index & 255u;
@@ -4879,6 +4945,10 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             if (record == nullptr) { error = "GE vertex record outside guest memory"; return false; }
             const VertexByteView record_view{record, layout.stride};
             const auto decode = [&](Vertex &out) {
+                if (ambient_0115) {
+                    return decode_vertex_0115_ambient_fast(record_view,0u,layout,commands,
+                        transform,out,error,primitive_lighting,primitive_ambient_cache);
+                }
                 return decode_vertex_optimized(record_view, 0u, layout,
                     commands, transform, out, error, &primitive_lighting, &primitive_light_cache,
                     environment_uv ? &primitive_environment : nullptr);

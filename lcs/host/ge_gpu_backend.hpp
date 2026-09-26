@@ -27,6 +27,15 @@ struct GeGpuDrawDescriptor {
     std::uint32_t framebuffer_address{};
     std::uint32_t framebuffer_stride{};
     std::uint32_t framebuffer_format{};
+    // REGION2 holds inclusive PSP drawing maxima, separate from the row
+    // stride and a host framebuffer's retained allocation dimensions.
+    // REGION1 is retained for diagnostics; it is not a second scissor origin.
+    // Legacy callers without captured GE region state keep their old bounds.
+    bool region_defined{};
+    std::int32_t region_x0{};
+    std::int32_t region_y0{};
+    std::int32_t region_x1{1023};
+    std::int32_t region_y1{1023};
     std::uint32_t texture_format{};
     std::uint32_t texture_address{};
     std::uint32_t texture_buffer_width{};

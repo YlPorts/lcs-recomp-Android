@@ -9,7 +9,7 @@
 #include <vector>
 namespace lcs {
 namespace {
-constexpr std::size_t kMaxPayload=64u*1024u*1024u, kMaxEntries=16000u;
+constexpr std::size_t kMaxPayload=64u*1024u*1024u, kMaxEntries=32000u;
 std::atomic<int> status{0};
 std::mutex request_mutex;
 std::string requested_path;

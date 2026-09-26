@@ -13,7 +13,7 @@ def main():
  ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('capture',type=Path);ap.add_argument('--out',type=Path,default=Path('capture-review'));args=ap.parse_args()
  args.out.mkdir(parents=True,exist_ok=True)
  with zipfile.ZipFile(args.capture) as z:
-  info=z.infolist();assert len(info)<=17000 and sum(x.file_size for x in info)<=70*1024*1024,'Capture exceeds diagnostic bounds'
+  info=z.infolist();assert len(info)<=33000 and sum(x.file_size for x in info)<=70*1024*1024,'Capture exceeds diagnostic bounds'
   manifest=json.loads(z.read('manifest.json'));assert manifest['format']=='LCS-GE-capture-1'
   print(json.dumps(manifest,indent=2));items=[]
   for name in z.namelist():

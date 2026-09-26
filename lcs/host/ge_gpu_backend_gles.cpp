@@ -87,8 +87,13 @@ struct GlesDepthHash {
 };
 struct GlesTarget {
     std::uint32_t address{};
+    // Updated when a draw executes, not while future batches are queued. The
+    // same VRAM address can be a full scene and later a 64x64 reflection map.
+    std::uint32_t framebuffer_stride{};
+    std::uint32_t framebuffer_format{};
     std::uint32_t logical_width{kReferenceWidth};
     std::uint32_t logical_height{kReferenceHeight};
+    std::uint32_t allocation_width{}, allocation_height{};
     std::uint32_t render_width{};
     std::uint32_t render_height{};
     GLuint color{};
@@ -97,10 +102,20 @@ struct GlesTarget {
     GlesDepthKey bound_depth_key{};
     GLuint fbo{};
     GLuint feedback{};
+    // One bounded sampling view per target. It gives a smaller PSP texture
+    // its own repeat/linear-filter edges even when the FBO allocation is larger.
+    GLuint sampling_view{};
+    std::uint32_t sampling_width{}, sampling_height{};
+    std::uint64_t color_revision{}, sampling_revision{};
     GLuint blend_copy{};
     bool cleared{};
 };
 
+struct GlesFeedbackSnapshot {
+    bool available{};
+    std::uint32_t stride{}, format{}, width{}, height{};
+    bool stride_match{}, format_match{}, cropped_view{};
+};
 struct GlesBatch {
     GeGpuDrawDescriptor draw{};
     std::vector<GeGpuVertex> vertices;
@@ -111,6 +126,8 @@ struct GlesBatch {
     bool clip_coordinates{};
     GeGpuClipViewport clip_viewport{};
     GeGpuHardwareTransform transform{};
+    std::uint32_t target_allocation_width{}, target_allocation_height{};
+    GlesFeedbackSnapshot feedback_state{};
 };
 
 struct GlesState {
@@ -137,6 +154,9 @@ struct GlesState {
     std::uint64_t perf_color_tests{};
     std::uint64_t perf_clip_draws{};
     std::uint64_t perf_clip_vertices{};
+    std::uint64_t perf_feedback_crops{}, perf_feedback_aliases{};
+    std::uint64_t sampling_view_bytes{};
+    bool feedback_alias_warning{};
 
     std::mutex window_mutex;
     ANativeWindow *window{};
@@ -308,20 +328,34 @@ GLuint link_program(const char *vs_source, const char *fs_source, std::string &e
     return 0u;
 }
 
-void delete_target(GlesTarget &target) noexcept {
+constexpr std::uint64_t kSamplingViewByteLimit = 64ull * 1024ull * 1024ull;
+void release_sampling_view(GlesState &s, GlesTarget &target) noexcept {
+    if (target.sampling_view != 0u) {
+        glDeleteTextures(1, &target.sampling_view);
+        const auto bytes = std::uint64_t(target.sampling_width) * target.sampling_height * 4u;
+        s.sampling_view_bytes -= std::min(s.sampling_view_bytes, bytes);
+    }
+    target.sampling_view = 0u;
+    target.sampling_width = target.sampling_height = 0u;
+    target.sampling_revision = 0u;
+}
+void delete_target(GlesState &s, GlesTarget &target) noexcept {
     if (target.feedback != 0u) glDeleteTextures(1, &target.feedback);
+    release_sampling_view(s, target);
     if (target.blend_copy != 0u) glDeleteTextures(1, &target.blend_copy);
     if (target.fbo != 0u) glDeleteFramebuffers(1, &target.fbo);
     if (target.depth != 0u && !target.shared_depth) glDeleteRenderbuffers(1, &target.depth);
     target.shared_depth.reset();
     if (target.color != 0u) glDeleteTextures(1, &target.color);
     target.feedback = 0u;
+    ++target.color_revision;
     target.blend_copy = 0u;
     target.fbo = 0u;
     target.depth = 0u;
     target.color = 0u;
     target.render_width = 0u;
     target.render_height = 0u;
+    target.allocation_width = target.allocation_height = 0u;
     target.cleared = false;
 }
 
@@ -342,7 +376,7 @@ void destroy_gl_objects(GlesState &s) noexcept {
     s.texture_cache_bytes = 0u;
     for (auto &[key, target] : s.targets) {
         (void)key;
-        delete_target(target);
+        delete_target(s, target);
     }
     s.targets.clear();
     s.depths.clear();
@@ -974,10 +1008,41 @@ GlesTarget &target_metadata(GlesState &s, std::uint32_t address) {
     auto [it, inserted] = s.targets.try_emplace(address);
     if (inserted) {
         it->second.address = address;
-        it->second.logical_width = s.display_logical_width;
-        it->second.logical_height = s.display_logical_height;
+        it->second.logical_width = address == s.display_framebuffer ? s.display_logical_width : 1u;
+        it->second.logical_height = address == s.display_framebuffer ? s.display_logical_height : 1u;
     }
     return it->second;
+}
+
+struct GlesDrawBounds {
+    std::int32_t x0{}, y0{}, x1{}, y1{};
+};
+GlesDrawBounds draw_bounds(const GeGpuDrawDescriptor &draw) noexcept {
+    GlesDrawBounds out{draw.scissor_x0, draw.scissor_y0, draw.scissor_x1, draw.scissor_y1};
+    if (draw.region_defined) {
+        // REGION2 clips the maximum drawing extent. REGION1 is not a second
+        // scissor origin (its fields control an undocumented rendering rate).
+        // Match PPSSPP Software/BinManager's scissor/REGION2 intersection.
+        out.x1 = std::min(out.x1, draw.region_x1);
+        out.y1 = std::min(out.y1, draw.region_y1);
+    }
+    return out;
+}
+
+void grow_target_for_draw(GlesState &s, GlesTarget &target,
+                          const GeGpuDrawDescriptor &draw) noexcept {
+    const auto bounds = draw_bounds(draw);
+    const auto width = std::max(std::clamp(draw.framebuffer_stride, 1u, 1024u),
+        static_cast<std::uint32_t>(std::clamp(bounds.x1 + 1, 1, 1024)));
+    const auto height = static_cast<std::uint32_t>(std::clamp(bounds.y1 + 1, 1, 1024));
+    // A small offscreen map must not inherit display dimensions. Preserve
+    // contents if an existing address is later reused with a smaller region.
+    target.logical_width = std::max(target.logical_width, width);
+    target.logical_height = std::max(target.logical_height, height);
+    if (!draw.region_defined) {
+        target.logical_width = std::max(target.logical_width, s.display_logical_width);
+        target.logical_height = std::max(target.logical_height, s.display_logical_height);
+    }
 }
 
 GlesBatch take_batch(GlesState &s) {
@@ -1038,12 +1103,15 @@ bool ensure_target(GlesState &s, GlesTarget &target, std::string &error) {
 
     if (target.fbo != 0u &&
         target.render_width == render_width &&
-        target.render_height == render_height)
+        target.render_height == render_height &&
+        target.allocation_width == logical_width && target.allocation_height == logical_height)
         return true;
 
-    delete_target(target);
+    delete_target(s, target);
     target.render_width = render_width;
     target.render_height = render_height;
+    target.allocation_width = logical_width;
+    target.allocation_height = logical_height;
 
     if (s.frame_epoch <= 12u) {
         runtime_log_line("gles: create target " +
@@ -1079,7 +1147,7 @@ bool ensure_target(GlesState &s, GlesTarget &target, std::string &error) {
 
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
         error = "OpenGL ES framebuffer incomplete";
-        delete_target(target);
+        delete_target(s, target);
         return false;
     }
 
@@ -1254,17 +1322,32 @@ void set_transform_uniforms(
     glUniform1i(s.u_vertex_color_affine, hw.vertex_color_affine ? 1 : 0);
 }
 
+bool feedback_stride_matches(const GlesTarget &source, const GeGpuDrawDescriptor &draw) noexcept {
+    return draw.texture_buffer_width == 0u || source.framebuffer_stride == 0u ||
+           draw.texture_buffer_width == source.framebuffer_stride;
+}
+bool feedback_format_matches(const GlesTarget &source, const GeGpuDrawDescriptor &draw) noexcept {
+    return source.framebuffer_stride == 0u || draw.texture_format == source.framebuffer_format;
+}
+bool feedback_needs_view(const GlesTarget &source, const GeGpuDrawDescriptor &draw) noexcept {
+    return feedback_stride_matches(source, draw) && feedback_format_matches(source, draw) &&
+        draw.texture_width != 0u && draw.texture_height != 0u &&
+        draw.texture_width <= source.allocation_width && draw.texture_height <= source.allocation_height &&
+        (draw.texture_width < source.allocation_width || draw.texture_height < source.allocation_height);
+}
+
 void set_pixel_uniforms(GlesState &s, const GeGpuDrawDescriptor &draw,
                         bool textured) {
     const bool flip=draw.texture_enabled && feedback_target(s, draw.texture_address)!=s.targets.end();
     float feedback_x=1.0f,feedback_y=1.0f;
     if(flip && draw.texture_width != 0u && draw.texture_height != 0u){
         const auto &source=feedback_target(s,draw.texture_address)->second;
-        // Different row strides require address remapping, not just UV scaling.
-        // Retain the previous path for that unsupported aliasing case.
-        if(draw.texture_buffer_width == 0u || draw.texture_buffer_width == source.logical_width){
-            feedback_x=float(draw.texture_width)/float(std::max(1u,source.logical_width));
-            feedback_y=float(draw.texture_height)/float(std::max(1u,source.logical_height));
+        // The PSP row stride is not the retained FBO allocation width. LCS
+        // reuses a full scene address for its 64-stride vehicle reflection map.
+        if(feedback_stride_matches(source, draw) && feedback_format_matches(source, draw) &&
+           !feedback_needs_view(source, draw)){
+            feedback_x=float(draw.texture_width)/float(std::max(1u,source.allocation_width));
+            feedback_y=float(draw.texture_height)/float(std::max(1u,source.allocation_height));
         }
     }
     const std::array<std::uint32_t,21> key{{
@@ -1326,6 +1409,61 @@ GLuint texture_for_draw(GlesState &s, const GeGpuDrawDescriptor &draw,
     const auto framebuffer = feedback_target(s, draw.texture_address);
     if (framebuffer != s.targets.end() && framebuffer->second.color != 0u) {
         GlesTarget &source = framebuffer->second;
+        if (!feedback_stride_matches(source, draw) || !feedback_format_matches(source, draw)) {
+            ++s.perf_feedback_aliases;
+            if (!s.feedback_alias_warning) {
+                s.feedback_alias_warning = true;
+                runtime_log_line("gles: feedback alias needs byte reinterpretation; textureStride=" +
+                    std::to_string(draw.texture_buffer_width) + " sourceStride=" +
+                    std::to_string(source.framebuffer_stride) + " textureFormat=" +
+                    std::to_string(draw.texture_format) + " sourceFormat=" +
+                    std::to_string(source.framebuffer_format));
+            }
+        }
+        if (feedback_needs_view(source, draw)) {
+            // Use the texture's actual allocation, not an extent grown ahead
+            // by a later queued draw or a newly selected rendering scale.
+            const auto width = draw.texture_width * (source.render_width / source.allocation_width);
+            const auto height = draw.texture_height * (source.render_height / source.allocation_height);
+            if (!source.sampling_view || source.sampling_width != width || source.sampling_height != height) {
+                const auto previous_bytes = std::uint64_t(source.sampling_width) * source.sampling_height * 4u;
+                const auto required_bytes = std::uint64_t(width) * height * 4u;
+                // Retain one view per target with a hard global bound. Even a
+                // maximum 1024x1024 PSP target at the supported 4x scale fits.
+                for (auto &[address, other] : s.targets) {
+                    (void)address;
+                    if (s.sampling_view_bytes - previous_bytes + required_bytes <= kSamplingViewByteLimit) break;
+                    if (&other != &source) release_sampling_view(s, other);
+                }
+                if (!source.sampling_view) glGenTextures(1, &source.sampling_view);
+                glBindTexture(GL_TEXTURE_2D, source.sampling_view);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height,
+                             0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                source.sampling_width = width;
+                source.sampling_height = height;
+                s.sampling_view_bytes = s.sampling_view_bytes - previous_bytes + required_bytes;
+                source.sampling_revision = source.color_revision - 1u;
+            } else glBindTexture(GL_TEXTURE_2D, source.sampling_view);
+            if (source.sampling_revision != source.color_revision) {
+                GLint previous_read = 0;
+                glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previous_read);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, source.fbo);
+                // PSP (0,0) is the top-left corner; GL copies from bottom-left.
+                glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0,
+                    static_cast<GLint>(source.render_height - height), width, height);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(previous_read));
+                source.sampling_revision = source.color_revision;
+                ++s.perf_feedback_crops;
+                ++s.report.vram_feedback_refreshes;
+            }
+            // Also safe for self-feedback: the copy precedes this draw, and
+            // completing the draw advances color_revision for the next read.
+            return source.sampling_view;
+        }
         if (current_target == &source) {
             if (source.feedback == 0u) {
                 glGenTextures(1, &source.feedback);
@@ -1451,6 +1589,7 @@ void draw_ordered_blend(GlesState &s, GlesTarget &target, const GlesBatch &batch
 
 bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
     GlesTarget &target = target_metadata(s, batch.draw.framebuffer_address);
+    grow_target_for_draw(s, target, batch.draw);
     if (s.frame_epoch <= 12u) {
         runtime_log_line("gles: draw frame=" + std::to_string(s.frame_epoch) +
                          " fb=" + std::to_string(target.address) +
@@ -1458,6 +1597,8 @@ bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
                          " idx=" + std::to_string(batch.indices.size()));
     }
     if (!ensure_target(s, target, error)) return false;
+    batch.target_allocation_width = target.allocation_width;
+    batch.target_allocation_height = target.allocation_height;
 
     glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
     if (!bind_target_depth(s,target,batch.draw,error)) return false;
@@ -1474,6 +1615,7 @@ bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
         // Shared depth must not be erased merely because a second colour target appears.
         glClear(GL_COLOR_BUFFER_BIT | (batch.draw.depthbuffer_defined ? 0u : GL_DEPTH_BUFFER_BIT));
         target.cleared = true;
+        ++target.color_revision;
     }
 
     const std::uint32_t logical_width =
@@ -1494,10 +1636,11 @@ bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
             0, static_cast<std::int64_t>(target.render_height)));
     };
 
-    const GLint left = scale_x(batch.draw.scissor_x0);
-    const GLint right = scale_x(batch.draw.scissor_x1 + 1);
-    const GLint top = scale_y(batch.draw.scissor_y0);
-    const GLint bottom = scale_y(batch.draw.scissor_y1 + 1);
+    const auto bounds = draw_bounds(batch.draw);
+    const GLint left = scale_x(bounds.x0);
+    const GLint right = scale_x(bounds.x1 + 1);
+    const GLint top = scale_y(bounds.y0);
+    const GLint bottom = scale_y(bounds.y1 + 1);
     if (right <= left || bottom <= top) return true;
 
     glEnable(GL_SCISSOR_TEST);
@@ -1528,6 +1671,13 @@ bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
     set_transform_uniforms(s, batch, logical_width, logical_height);
 
     glActiveTexture(GL_TEXTURE0);
+    const auto source = feedback_target(s, batch.draw.texture_address);
+    if (batch.draw.texture_enabled && source != s.targets.end() && source->second.color != 0u) {
+        const auto &t = source->second;
+        batch.feedback_state = {true, t.framebuffer_stride, t.framebuffer_format,
+            t.allocation_width, t.allocation_height, feedback_stride_matches(t,batch.draw),
+            feedback_format_matches(t,batch.draw), feedback_needs_view(t,batch.draw)};
+    }
     const GLuint texture = texture_for_draw(s, batch.draw, &target);
     const bool textured = batch.draw.texture_enabled && texture != 0u;
     if (batch.draw.texture_enabled && !texture) ++s.perf_missing_textures;
@@ -1564,6 +1714,9 @@ bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
                      static_cast<GLsizei>(batch.vertices.size()));
     }
 
+    ++target.color_revision;
+    target.framebuffer_stride = batch.draw.framebuffer_stride;
+    target.framebuffer_format = batch.draw.framebuffer_format;
     ++s.report.game_draw_calls;
     s.report.game_vertices += batch.indices.empty()
         ? batch.vertices.size() : batch.indices.size();
@@ -1794,15 +1947,7 @@ void ge_gpu_backend_record_draw(const GeGpuDrawDescriptor &draw) noexcept {
     if (draw.texture_enabled) ++s.report.textured_draw_calls;
 
     GlesTarget &target = target_metadata(s, draw.framebuffer_address);
-    target.logical_width = std::max<std::uint32_t>(
-        target.logical_width,
-        std::max<std::uint32_t>(
-            static_cast<std::uint32_t>(std::max(0, draw.scissor_x1 + 1)),
-            std::min<std::uint32_t>(
-                std::max<std::uint32_t>(1u, draw.framebuffer_stride), 1024u)));
-    target.logical_height = std::max<std::uint32_t>(
-        target.logical_height,
-        static_cast<std::uint32_t>(std::max(1, draw.scissor_y1 + 1)));
+    grow_target_for_draw(s, target, draw);
 }
 
 void ge_gpu_backend_observe_camera(
@@ -2048,6 +2193,9 @@ bool gles_draw_state_compatible(
         (b.framebuffer_address & 0x001FFFF0u)) return false;
     if (a.framebuffer_format != b.framebuffer_format ||
         a.framebuffer_stride != b.framebuffer_stride) return false;
+    if (a.region_defined != b.region_defined || (a.region_defined &&
+        (a.region_x0 != b.region_x0 || a.region_y0 != b.region_y0 ||
+         a.region_x1 != b.region_x1 || a.region_y1 != b.region_y1))) return false;
 
     if (a.scissor_x0 != b.scissor_x0 || a.scissor_y0 != b.scissor_y0 ||
         a.scissor_x1 != b.scissor_x1 || a.scissor_y1 != b.scissor_y1)
@@ -2360,12 +2508,33 @@ void capture_gpu_frame(GlesState &s) noexcept {
                 metadata+=",\""+std::string(name)+"\":"+std::to_string(value);
             };
             field("textureAddress",draw.texture_address);field("textureEnabled",draw.texture_enabled);
-            field("framebufferFeedback",draw.texture_enabled && feedback_target(s,draw.texture_address)!=s.targets.end());
+            field("framebufferFeedback",batch.feedback_state.available);
             field("textureFormat",draw.texture_format);field("textureWidth",draw.texture_width);field("textureHeight",draw.texture_height);
             field("textureBufferWidth",draw.texture_buffer_width);
             field("textureFunction",draw.texture_function);field("textureUseAlpha",draw.texture_use_alpha);
             field("textureDouble",draw.texture_double_color);field("textureEnv",draw.texture_env);
             field("framebufferAddress",draw.framebuffer_address);field("framebufferFormat",draw.framebuffer_format);
+            field("framebufferStride",draw.framebuffer_stride);
+            field("regionDefined",draw.region_defined);
+            field("regionX0",draw.region_x0);field("regionY0",draw.region_y0);
+            field("regionX1",draw.region_x1);field("regionY1",draw.region_y1);
+            const auto bounds=draw_bounds(draw);
+            field("drawingX0",bounds.x0);field("drawingY0",bounds.y0);
+            field("drawingX1",bounds.x1);field("drawingY1",bounds.y1);
+            // The same address can change layout several times in this frame.
+            // Serialize execution-time state rather than the final target map.
+            field("targetAllocationWidth",batch.target_allocation_width);
+            field("targetAllocationHeight",batch.target_allocation_height);
+            if(batch.feedback_state.available){
+                const auto&source=batch.feedback_state;
+                field("feedbackSourceStride",source.stride);
+                field("feedbackSourceFormat",source.format);
+                field("feedbackAllocationWidth",source.width);
+                field("feedbackAllocationHeight",source.height);
+                field("feedbackStrideMatch",source.stride_match);
+                field("feedbackFormatMatch",source.format_match);
+                field("feedbackCroppedView",source.cropped_view);
+            }
             field("blendEnabled",draw.blend_enabled);field("blendEquation",draw.blend_equation);
             field("blendSource",draw.blend_source_factor);field("blendDest",draw.blend_dest_factor);
             field("blendFixSource",draw.blend_fix_source);field("blendFixDest",draw.blend_fix_dest);
@@ -2506,6 +2675,8 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
             " batchReuses="+std::to_string(s.batch_reuses)+
             " batchPoolMB="+std::to_string(s.batch_pool_bytes/(1024u*1024u))+
             " missingTextures="+std::to_string(s.perf_missing_textures)+
+            " feedbackCrops="+std::to_string(s.perf_feedback_crops)+
+            " feedbackAliases="+std::to_string(s.perf_feedback_aliases)+
             " blends="+std::to_string(s.perf_blend_equations[0])+","+
                 std::to_string(s.perf_blend_equations[1])+","+
                 std::to_string(s.perf_blend_equations[2])+","+
@@ -2514,6 +2685,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
                 std::to_string(s.perf_blend_equations[5]));
         s.perf_blend_equations.fill(0);
         s.perf_blend_fallbacks=s.perf_missing_textures=0;
+        s.perf_feedback_crops=s.perf_feedback_aliases=0;
         s.perf_clip_draws=s.perf_clip_vertices=0;
         s.merged_clip_batches=0;
         s.perf_presents = s.perf_epochs = s.perf_color_tests = 0;
