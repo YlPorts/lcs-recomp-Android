@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <chrono>
 #include <cstddef>
@@ -38,6 +39,22 @@ namespace {
 constexpr std::uint32_t kReferenceWidth = 480u;
 constexpr std::uint32_t kReferenceHeight = 272u;
 
+// Only GLES-consumed attributes. Do not upload desktop control words that are
+// already per-draw uniforms. All positions/UV/fog retain full float precision.
+struct GlesStreamVertex {
+    float x,y,z,w;
+    std::uint32_t rgba;
+    float u,v,fog_factor,q;
+    explicit GlesStreamVertex(const GeGpuVertex &v) noexcept
+        : x(v.x),y(v.y),z(v.z),w(v.w),rgba(v.rgba),u(v.u),v(v.v),
+          fog_factor(v.fog_factor),q(v.q) {}
+};
+static_assert(sizeof(GlesStreamVertex)==36);
+struct GlesGeometrySlot {
+    GLuint vertices{},indices{};
+    std::size_t vertex_capacity{},index_capacity{};
+    GLsync fence{};
+};
 struct GlesTexture {
     GLuint id{};
     std::uint32_t width{};
@@ -87,7 +104,7 @@ struct GlesState {
     std::uint64_t merged_clip_batches{};
     std::uint64_t validation_epoch{1u};
     std::unordered_map<std::uint32_t, GLuint> samplers;
-    std::array<std::uint32_t,16> pixel_uniform_key{};
+    std::array<std::uint32_t,19> pixel_uniform_key{};
     bool pixel_uniform_valid{};
     bool cpu_transform_uniform_valid{};
     std::uint32_t uniform_width{}, uniform_height{};
@@ -133,6 +150,7 @@ struct GlesState {
     GLint u_vertex_color_affine{-1};
 
     GLint u_tex{-1};
+    GLint u_texture_lod_mode{-1},u_texture_lod_bias{-1},u_texture_max_lod{-1};
     GLint u_texture_flip_v{-1};
     GLint u_color_test{-1};
     GLint u_color_reference{-1};
@@ -159,7 +177,11 @@ struct GlesState {
 
     std::unordered_map<std::uint64_t, GlesTexture> textures;
     android_detail::TextureVersions texture_versions;
-    std::vector<GeGpuVertex> frame_vertices;
+    std::vector<GlesStreamVertex> frame_vertices;
+    std::array<GlesGeometrySlot,3> geometry_slots{};
+    std::size_t geometry_slot{};
+    std::uint64_t buffer_wait_ns{},geometry_uploaded_bytes{},geometry_allocations{};
+    std::uint64_t perf_fixed_lod{},perf_separate_clut{},cache_peak_bytes{};
     std::vector<std::uint32_t> frame_indices;
     std::uint64_t texture_cache_bytes{};
     std::uint32_t texture_cache_entry_limit{8192u};
@@ -296,8 +318,12 @@ void destroy_gl_objects(GlesState &s) noexcept {
         delete_target(target);
     }
     s.targets.clear();
-    if (s.vbo != 0u) glDeleteBuffers(1, &s.vbo);
-    if (s.ebo != 0u) glDeleteBuffers(1, &s.ebo);
+    for (auto &slot:s.geometry_slots) {
+        if (slot.fence) glDeleteSync(slot.fence);
+        if (slot.vertices) glDeleteBuffers(1,&slot.vertices);
+        if (slot.indices) glDeleteBuffers(1,&slot.indices);
+        slot={};
+    }
     if (s.blend_ebo != 0u) glDeleteBuffers(1, &s.blend_ebo);
     if (s.vao != 0u) glDeleteVertexArrays(1, &s.vao);
     if (s.present_vao != 0u) glDeleteVertexArrays(1, &s.present_vao);
@@ -381,6 +407,9 @@ precision highp float;
 precision highp int;
 
 uniform sampler2D uTexture;
+uniform int uTextureLodMode;
+uniform float uTextureLodBias;
+uniform float uTextureMaxLod;
 uniform sampler2D uDestination;
 uniform int uBlendRead;
 uniform int uBlendEquation;
@@ -456,7 +485,10 @@ void main() {
         if (uTextureFlipV != 0) sampleUv.y = 1.0 - sampleUv.y;
         // Match the D3D12 backend: PSP UV has already been transformed into
         // sampler space by the GE vertex path. Do not renormalize or flip here.
-        vec4 texel = texture(uTexture, sampleUv);
+        // PSP constant LOD is not the host's derivative-selected mip level.
+        vec4 texel = uTextureLodMode == 1
+            ? textureLod(uTexture,sampleUv,clamp(uTextureLodBias,0.0,uTextureMaxLod))
+            : texture(uTexture,sampleUv,uTextureLodBias);
         int fn = uTextureFunction & 7;
         if (fn == 0) {
             color.rgb *= texel.rgb;
@@ -602,20 +634,20 @@ void main() {
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.ebo);
 
     glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, sizeof(GeGpuVertex),
-                          reinterpret_cast<void *>(offsetof(GeGpuVertex, x)));
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, sizeof(GlesStreamVertex),
+                          reinterpret_cast<void *>(offsetof(GlesStreamVertex, x)));
     glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(GeGpuVertex),
-                          reinterpret_cast<void *>(offsetof(GeGpuVertex, rgba)));
+    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(GlesStreamVertex),
+                          reinterpret_cast<void *>(offsetof(GlesStreamVertex, rgba)));
     glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(GeGpuVertex),
-                          reinterpret_cast<void *>(offsetof(GeGpuVertex, u)));
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(GlesStreamVertex),
+                          reinterpret_cast<void *>(offsetof(GlesStreamVertex, u)));
     glEnableVertexAttribArray(3);
-    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(GeGpuVertex),
-                          reinterpret_cast<void *>(offsetof(GeGpuVertex, fog_factor)));
+    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(GlesStreamVertex),
+                          reinterpret_cast<void *>(offsetof(GlesStreamVertex, fog_factor)));
     glEnableVertexAttribArray(4);
-    glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(GeGpuVertex),
-                          reinterpret_cast<void *>(offsetof(GeGpuVertex, q)));
+    glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(GlesStreamVertex),
+                          reinterpret_cast<void *>(offsetof(GlesStreamVertex, q)));
     glBindVertexArray(0);
 
     s.u_mode = glGetUniformLocation(s.program, "uMode");
@@ -633,6 +665,9 @@ void main() {
     s.u_vertex_color_affine = glGetUniformLocation(s.program, "uVertexColorAffine");
 
     s.u_tex = glGetUniformLocation(s.program, "uTexture");
+    s.u_texture_lod_mode=glGetUniformLocation(s.program,"uTextureLodMode");
+    s.u_texture_lod_bias=glGetUniformLocation(s.program,"uTextureLodBias");
+    s.u_texture_max_lod=glGetUniformLocation(s.program,"uTextureMaxLod");
     s.u_texture_flip_v = glGetUniformLocation(s.program, "uTextureFlipV");
     s.u_color_test = glGetUniformLocation(s.program, "uColorTest");
     s.u_color_reference = glGetUniformLocation(s.program, "uColorReference");
@@ -659,6 +694,12 @@ void main() {
     s.u_destination=glGetUniformLocation(s.program,"uDestination");
 
     glBindVertexArray(0);
+    s.geometry_slots[0].vertices=s.vbo;
+    s.geometry_slots[0].indices=s.ebo;
+    for (std::size_t i=1;i<s.geometry_slots.size();++i) {
+        glGenBuffers(1,&s.geometry_slots[i].vertices);
+        glGenBuffers(1,&s.geometry_slots[i].indices);
+    }
     s.gl_ready = true;
     runtime_log_line("gles: create_gl_objects complete");
     return true;
@@ -801,23 +842,19 @@ std::uint64_t texture_key(const GeGpuDrawDescriptor &draw) noexcept {
                 ? draw.texture_level_heights[level] : draw.texture_height);
     }
     key = hash_mix(key, draw.texture_format);
-    key = hash_mix(key, draw.clut_address);
-    key = hash_mix(key, draw.clut_format);
-    key = hash_mix(key, draw.clut_shift);
-    key = hash_mix(key, draw.clut_mask);
-    key = hash_mix(key, draw.clut_start);
-    key = hash_mix(key, draw.clut_checksum);
-    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_swizzled));
-    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_min_linear));
-    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_mag_linear));
-    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_mipmap_enabled));
-    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_mipmap_linear));
-    key = hash_mix(key, draw.texture_max_level);
-    key = hash_mix(key, draw.texture_level_mode);
-    key = hash_mix(key, static_cast<std::uint32_t>(draw.texture_level_offset16));
-    key = hash_mix(key, draw.texture_selected_level);
-    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_clamp_u));
-    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_clamp_v));
+    const bool indexed=draw.texture_format>=4u && draw.texture_format<=7u;
+    if (indexed) {
+        // Source RAM palette addresses and unused CLUT entries do not change
+        // decoded pixels. Effective palette identity comes from actual lookups.
+        key=hash_mix(key,draw.clut_format);
+        key=hash_mix(key,draw.clut_shift);
+        key=hash_mix(key,draw.clut_mask);
+        key=hash_mix(key,draw.clut_start);
+        key=hash_mix(key,draw.palette_signature ? draw.palette_signature:draw.clut_checksum);
+        key=hash_mix(key,draw.texture_clut_shared);
+    }
+    key=hash_mix(key,draw.texture_swizzled);
+    // Sampler/filter/LOD are captured by each draw, not baked into RGBA images.
     return key == 0u ? 1u : key;
 }
 
@@ -874,30 +911,26 @@ std::uint64_t read_texture_byte_limit() noexcept {
 }
 
 void trim_texture_cache(GlesState &s, bool aggressive) {
-    const auto over_budget = [&]() {
-        return s.textures.size() > s.texture_cache_entry_limit ||
-               s.texture_cache_bytes > s.texture_cache_byte_limit;
-    };
-
-    while (over_budget()) {
-        auto victim = s.textures.end();
-        for (auto it = s.textures.begin(); it != s.textures.end(); ++it) {
-            // Never delete a texture referenced by batches accumulated for the
-            // frame currently being drawn.
-            if (it->second.last_used_epoch >= s.frame_epoch) continue;
-            if (!aggressive && it->second.last_used_epoch + 2u >= s.frame_epoch)
-                continue;
-            if (victim == s.textures.end() ||
-                it->second.last_used_epoch < victim->second.last_used_epoch)
-                victim = it;
-        }
-        if (victim == s.textures.end()) break;
-
-        if (victim->second.id != 0u) glDeleteTextures(1, &victim->second.id);
-        s.texture_cache_bytes -=
-            std::min(s.texture_cache_bytes, victim->second.byte_size);
-        s.textures.erase(victim);
-        ++s.report.evicted_textures;
+    const auto over=[&] {return s.textures.size()>s.texture_cache_entry_limit ||
+        s.texture_cache_bytes>s.texture_cache_byte_limit;};
+    if (!over()) return;
+    // During uploads retain a small overflow; prune after the queued frame.
+    if (!aggressive && s.texture_cache_bytes<=s.texture_cache_byte_limit*5u/4u &&
+        s.textures.size()<=s.texture_cache_entry_limit*5u/4u) return;
+    std::vector<std::pair<std::uint64_t,std::uint64_t>> candidates;
+    candidates.reserve(s.textures.size());
+    for (const auto &[key,t]:s.textures)
+        if (t.last_used_epoch<s.frame_epoch)
+            candidates.emplace_back(t.last_used_epoch,key);
+    std::sort(candidates.begin(),candidates.end());
+    for (const auto &[epoch,key]:candidates) {
+        (void)epoch;
+        if (!over()) break;
+        auto it=s.textures.find(key);
+        if (it==s.textures.end()) continue;
+        if (it->second.id) glDeleteTextures(1,&it->second.id);
+        s.texture_cache_bytes-=std::min(s.texture_cache_bytes,it->second.byte_size);
+        s.textures.erase(it);++s.report.evicted_textures;
     }
 }
 
@@ -1139,16 +1172,23 @@ void set_transform_uniforms(
 void set_pixel_uniforms(GlesState &s, const GeGpuDrawDescriptor &draw,
                         bool textured) {
     const bool flip=draw.texture_enabled && feedback_target(s, draw.texture_address)!=s.targets.end();
-    const std::array<std::uint32_t,16> key{{
+    const std::array<std::uint32_t,19> key{{
         textured, draw.texture_function & 7u, draw.texture_use_alpha,
         draw.texture_double_color, draw.texture_env, draw.alpha_test_enabled,
         draw.alpha_function & 7u, draw.alpha_reference & 255u, draw.alpha_mask & 255u,
         draw.fog_enabled, draw.fog_color, draw.framebuffer_format & 3u,
         draw.color_test_enabled && !draw.clear_mode ? (draw.color_test_function & 3u)+1u : 0u,
-        draw.color_test_reference, draw.color_test_mask, flip}};
+        draw.color_test_reference, draw.color_test_mask, flip,
+        draw.texture_mipmap_enabled ? draw.texture_level_mode : 1u,
+        draw.texture_mipmap_enabled ? static_cast<std::uint32_t>(draw.texture_level_offset16) : 0u,
+        draw.texture_mipmap_enabled ? draw.texture_max_level : 0u}};
     if (s.pixel_uniform_valid && key==s.pixel_uniform_key) return;
     s.pixel_uniform_key=key; s.pixel_uniform_valid=true;
     glUniform1i(s.u_tex, 0);
+    const bool mips=draw.texture_mipmap_enabled;
+    glUniform1i(s.u_texture_lod_mode,!mips || draw.texture_level_mode==1u ? 1 : 0);
+    glUniform1f(s.u_texture_lod_bias,mips ? float(draw.texture_level_offset16)/16.0f : 0.0f);
+    glUniform1f(s.u_texture_max_lod,mips ? float(draw.texture_max_level) : 0.0f);
     glUniform1i(s.u_texture_flip_v,
         draw.texture_enabled && feedback_target(s, draw.texture_address) != s.targets.end());
     glUniform1i(s.u_color_test, draw.color_test_enabled && !draw.clear_mode
@@ -1437,6 +1477,8 @@ bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
             : batch.indices.size() / 3u);
     if (batch.clip_coordinates) { ++s.perf_clip_draws; s.perf_clip_vertices+=batch.vertices.size(); }
     if (batch.draw.color_test_enabled) ++s.perf_color_tests;
+    if (batch.draw.texture_mipmap_enabled && batch.draw.texture_level_mode==1u) ++s.perf_fixed_lod;
+    if (batch.draw.texture_format==4u && !batch.draw.texture_clut_shared) ++s.perf_separate_clut;
     if (textured) ++s.report.textured_game_draw_calls;
     if (batch.draw.depth_test_enabled) ++s.report.depth_tested_game_draw_calls;
     if (batch.draw.depth_write_enabled) ++s.report.depth_writing_game_draw_calls;
@@ -1871,10 +1913,14 @@ bool ge_gpu_backend_upload_decoded_texture_chain_packed(
     // safer than deleting a texture still needed by queued draw batches.
     trim_texture_cache(s, false);
 
-    s.last_texture_rgba = rgba8;
+    // This is only diagnostic state. Move ownership instead of retaining a
+    // second transient copy of each freshly decoded texture.
+    const auto uploaded_size=rgba8.size();
+    s.last_texture_rgba = std::move(rgba8);
+    s.cache_peak_bytes=std::max(s.cache_peak_bytes,s.texture_cache_bytes);
     ++s.report.decoded_texture_uploads;
-    s.report.decoded_texture_bytes += rgba8.size();
-    s.report.texture_image_upload_bytes += rgba8.size();
+    s.report.decoded_texture_bytes += uploaded_size;
+    s.report.texture_image_upload_bytes += uploaded_size;
     s.report.last_texture_key = key;
     s.report.last_texture_width = base_width;
     s.report.last_texture_height = base_height;
@@ -1923,6 +1969,9 @@ bool gles_draw_state_compatible(
             a.texture_mag_linear != b.texture_mag_linear ||
             a.texture_mipmap_enabled != b.texture_mipmap_enabled ||
             a.texture_mipmap_linear != b.texture_mipmap_linear ||
+            a.texture_level_mode != b.texture_level_mode ||
+            a.texture_level_offset16 != b.texture_level_offset16 ||
+            a.texture_max_level != b.texture_max_level ||
             a.texture_clamp_u != b.texture_clamp_u ||
             a.texture_clamp_v != b.texture_clamp_v)
             return false;
@@ -2132,6 +2181,60 @@ void ge_gpu_backend_display_logical_size(
     height = s.display_logical_height;
 }
 
+// Reuse bounded storage only after GPU completion. glBufferData on every
+// frame could orphan additional allocations while the GPU still used the old
+// ones. No cross-thread GL calls or client-side vertex arrays are introduced.
+bool upload_geometry_frame(GlesState &s,std::string &error) {
+    s.geometry_slot=static_cast<std::size_t>(s.frame_epoch%s.geometry_slots.size());
+    auto &slot=s.geometry_slots[s.geometry_slot];
+    if (slot.fence) {
+        const auto start=std::chrono::steady_clock::now();
+        auto status=glClientWaitSync(slot.fence,GL_SYNC_FLUSH_COMMANDS_BIT,0);
+        if (status==GL_TIMEOUT_EXPIRED)
+            status=glClientWaitSync(slot.fence,GL_SYNC_FLUSH_COMMANDS_BIT,1000000000ull);
+        s.buffer_wait_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-start).count();
+        if (status==GL_WAIT_FAILED || status==GL_TIMEOUT_EXPIRED) {
+            error="GPU geometry slot did not complete; refusing unsafe overwrite";return false;
+        }
+        glDeleteSync(slot.fence);slot.fence=nullptr;
+    }
+    s.vbo=slot.vertices;s.ebo=slot.indices;
+    glBindVertexArray(s.vao);
+    const auto upload=[&](GLenum type,GLuint object,std::size_t bytes,
+                           std::size_t &capacity,const void *data) {
+        glBindBuffer(type,object);
+        if (!bytes) return;
+        if (capacity<bytes) {
+            capacity=std::max<std::size_t>(65536,std::bit_ceil(bytes));
+            glBufferData(type,static_cast<GLsizeiptr>(capacity),nullptr,GL_STREAM_DRAW);
+            ++s.geometry_allocations;
+        }
+        glBufferSubData(type,0,static_cast<GLsizeiptr>(bytes),data);
+        s.geometry_uploaded_bytes+=bytes;
+    };
+    upload(GL_ARRAY_BUFFER,s.vbo,s.frame_vertices.size()*sizeof(GlesStreamVertex),
+        slot.vertex_capacity,s.frame_vertices.data());
+    upload(GL_ELEMENT_ARRAY_BUFFER,s.ebo,s.frame_indices.size()*sizeof(std::uint32_t),
+        slot.index_capacity,s.frame_indices.data());
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, sizeof(GlesStreamVertex),
+                          reinterpret_cast<void *>(offsetof(GlesStreamVertex, x)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(GlesStreamVertex),
+                          reinterpret_cast<void *>(offsetof(GlesStreamVertex, rgba)));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(GlesStreamVertex),
+                          reinterpret_cast<void *>(offsetof(GlesStreamVertex, u)));
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(GlesStreamVertex),
+                          reinterpret_cast<void *>(offsetof(GlesStreamVertex, fog_factor)));
+    glEnableVertexAttribArray(4);
+    glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(GlesStreamVertex),
+                          reinterpret_cast<void *>(offsetof(GlesStreamVertex, q)));
+    return true;
+}
+
 bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     GlesState &s = state();
     if (!s.enabled) return false;
@@ -2161,14 +2264,17 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
         total_vertices += batch.vertices.size();
         total_indices += batch.indices.size();
     }
+    if (total_vertices>4000000u || total_indices>24000000u) {
+        s.report.message="Excessive GE frame geometry rejected";
+        s.batches.clear();return false;
+    }
     try {
         s.frame_vertices.reserve(total_vertices);
         s.frame_indices.reserve(total_indices);
         for (GlesBatch &batch : s.batches) {
             batch.first_vertex = static_cast<std::uint32_t>(s.frame_vertices.size());
             batch.first_index = static_cast<std::uint32_t>(s.frame_indices.size());
-            s.frame_vertices.insert(
-                s.frame_vertices.end(), batch.vertices.begin(), batch.vertices.end());
+            for (const auto &v:batch.vertices) s.frame_vertices.emplace_back(v);
 
             if (!batch.indices.empty()) {
                 for (std::uint32_t index : batch.indices)
@@ -2180,19 +2286,9 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
         return false;
     }
 
-    glBindVertexArray(s.vao);
-    glBindBuffer(GL_ARRAY_BUFFER, s.vbo);
-    glBufferData(GL_ARRAY_BUFFER,
-                 static_cast<GLsizeiptr>(
-                     s.frame_vertices.size() * sizeof(GeGpuVertex)),
-                 s.frame_vertices.empty() ? nullptr : s.frame_vertices.data(),
-                 GL_STREAM_DRAW);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                 static_cast<GLsizeiptr>(
-                     s.frame_indices.size() * sizeof(std::uint32_t)),
-                 s.frame_indices.empty() ? nullptr : s.frame_indices.data(),
-                 GL_STREAM_DRAW);
+    if (!upload_geometry_frame(s,error)) {
+        s.report.message=error;s.batches.clear();return false;
+    }
 
     bool drew = false;
     for (GlesBatch &batch : s.batches) {
@@ -2214,6 +2310,9 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
             runtime_log_error("gles present", error);
     }
 
+    auto &used_slot=s.geometry_slots[s.geometry_slot];
+    used_slot.fence=glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0);
+    if (!used_slot.fence) glFinish(); // conservative recovery; never overwrite busy storage
     const auto perf_now = std::chrono::steady_clock::now();
     if (s.perf_window == std::chrono::steady_clock::time_point{}) s.perf_window = perf_now;
     ++s.perf_epochs;
@@ -2229,6 +2328,11 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
             " gpuClipVertices="+std::to_string(s.perf_clip_vertices)+
             " mergedClip="+std::to_string(s.merged_clip_batches)+
             " renderScale="+std::to_string(s.scale)+
+            " fixedLodDraws="+std::to_string(s.perf_fixed_lod)+
+            " separateClutDraws="+std::to_string(s.perf_separate_clut)+
+            " geomUploadKB="+std::to_string(s.geometry_uploaded_bytes/1024u)+
+            " bufferWaitMs="+std::to_string(double(s.buffer_wait_ns)/1e6)+
+            " geomAllocations="+std::to_string(s.geometry_allocations)+
             " blendFetch="+std::to_string(s.framebuffer_fetch_enabled ? 1 : 0)+
             " blendFallbacks="+std::to_string(s.perf_blend_fallbacks)+
             " missingTextures="+std::to_string(s.perf_missing_textures)+
@@ -2243,6 +2347,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
         s.perf_clip_draws=s.perf_clip_vertices=0;
         s.merged_clip_batches=0;
         s.perf_presents = s.perf_epochs = s.perf_color_tests = 0;
+        s.perf_fixed_lod=s.perf_separate_clut=s.geometry_uploaded_bytes=s.buffer_wait_ns=0;
         s.perf_window = perf_now;
     }
     s.report.game_frame_vblank = vblank;
@@ -2273,6 +2378,13 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
                          " render=" + std::to_string(s.report.offscreen_width) + "x" + std::to_string(s.report.offscreen_height) +
                          " cacheMB=" + std::to_string(
                              s.texture_cache_bytes / (1024u * 1024u)) +
+                         " cachePeakMB="+std::to_string(s.cache_peak_bytes/(1024u*1024u))+
+                         " versionEntries="+std::to_string(s.texture_versions.size())+
+                         " geometryBufferMB="+std::to_string(([&] {
+                             std::size_t bytes=0;for(const auto &slot:s.geometry_slots)
+                                 bytes+=slot.vertex_capacity+slot.index_capacity;
+                             return bytes;
+                         })()/(1024u*1024u))+
                          " draws=" + std::to_string(s.report.game_draw_calls) +
                          " texUploads=" + std::to_string(s.report.decoded_texture_uploads) +
                          " cacheHits=" + std::to_string(s.report.texture_cache_hits) +
@@ -2294,6 +2406,11 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     // All draw batches for this frame are now complete, so old cache entries
     // can be evicted safely if the configured memory/entry budget was exceeded.
     trim_texture_cache(s, true);
+    if ((s.frame_epoch%120u)==0u) {
+        s.texture_versions.retain([&](std::uint64_t base,std::uint64_t signature) {
+            return s.textures.find(signature?hash_mix(base,signature):base)!=s.textures.end();
+        });
+    }
     ++s.frame_epoch;
     ++s.validation_epoch;
     return presented;

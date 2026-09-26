@@ -172,6 +172,10 @@ Java_com_ylports_lcsrecomp_MainActivity_nativeRun(
     setenv("PSPRECOMP_INTERNAL_WIDTH", scale2 ? "960" : "480", 1);
     setenv("PSPRECOMP_INTERNAL_HEIGHT", scale2 ? "544" : "272", 1);
     setenv("PSPRECOMP_AUDIO", "1", 1);
+    // Resident decoded image budget, not a limit on textures within a frame.
+    // Current-frame versions remain pinned until their commands are consumed.
+    setenv("PSPRECOMP_GE_GPU_TEXTURE_CACHE_MB", "96", 1);
+    setenv("PSPRECOMP_GE_GPU_TEXTURE_DECODE_LIMIT", "8192", 1);
 
     // ATRAC3/ATRAC3+ streams now use FFmpeg. Keep the separate PMF movie path
     // skipped: CPU video-frame upload into an EGL-owned Surface needs its own

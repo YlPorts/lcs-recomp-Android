@@ -13,9 +13,11 @@ std::uint32_t runtime_dispatch_pc() noexcept {return 0;}
 namespace lcs {
 static GeTransformState captured;
 static std::array<std::uint32_t,256> captured_commands;
+static std::vector<std::array<std::uint64_t,3>> captured_revisions;
 bool test_capture_primitive(psprecomp::GuestMemory &,const std::array<std::uint32_t,256> &cmd,
  const GeTransformState &tr,std::uint32_t va,std::uint32_t ia,std::uint32_t,
- GeRenderStats &stats,std::string &,std::uint32_t,std::uint64_t,std::uint64_t,std::uint64_t,bool) {
+ GeRenderStats &stats,std::string &,std::uint32_t,std::uint64_t d,std::uint64_t v,std::uint64_t l,bool) {
+ captured_revisions.push_back({d,v,l});
  captured=tr;captured_commands=cmd;stats.next_vertex_address=va;stats.next_index_address=ia;return true;
 }
 void test_flush(psprecomp::GuestMemory &) {}
@@ -77,5 +79,14 @@ int main(int argc,char**argv) {
  run({0xc4000020u});cmd[0xc5]=1u|(15u<<8)|(31u<<16);cmd[0xc3]=5;
  memory.store8(texture,15);auto last16=make_texture_setup_for_level(memory,cmd,0,&captured.clut);
  assert(equal(sample_texture_nearest(memory,last16,0,0),{255,0,0,255}));
+ captured_revisions.clear();
+ run({0x04030003,0xc6000001,0x04030003,0x55010203,0x04030003});
+ assert(captured_revisions.size()==4);
+ assert(captured_revisions[0][0]!=captured_revisions[1][0]);
+ assert(captured_revisions[0][1]==captured_revisions[1][1]);
+ assert(captured_revisions[0][2]==captured_revisions[1][2]);
+ assert(captured_revisions[1][1]!=captured_revisions[2][1]);
+ assert(captured_revisions[1][2]!=captured_revisions[2][2]);
+ std::cout<<"PASS: actual GE interpreter preserves vertex/light revisions across sampler changes, invalidates material changes\n";
  std::cout<<"PASS: real CLUTLOAD retains bytes across RAM writes; partial/zero loads, queued snapshots, T4/T8/T16/T32, 16-bit entry 511\n";
 }

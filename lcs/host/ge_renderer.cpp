@@ -1,4 +1,5 @@
 #include "ge_renderer.hpp"
+#include "lcs_ge_state_policy.hpp"
 #include "lcs_ge_vertex_memo.hpp"
 #include "ge_gpu_backend.hpp"
 #include "lcs_controls.hpp"
@@ -150,6 +151,7 @@ std::uint64_t g_ge_primitive_count{};
 std::uint64_t g_ge_vertex_count{};
 std::uint64_t g_ge_memo_hits{};
 std::uint64_t g_ge_clut_loads{};
+std::uint64_t g_ge_vertex_states_reused{}, g_ge_clut_noops{}, g_ge_palette_key_hits{};
 std::uint64_t g_ge_texture_matrix_words{};
 std::uint64_t g_ge_palette_draws{};
 
@@ -466,6 +468,11 @@ void load_ge_clut(GeClutState &state, const psprecomp::GuestMemory &memory,
     if (count == 0u) return;
     ++state.loads;
     ++g_ge_clut_loads;
+    const auto *contiguous=memory.raw_pointer(address,count);
+    if (contiguous && state.snapshot && std::memcmp(contiguous,state.data().data(),count)==0) {
+        ++g_ge_clut_noops;
+        return; // A repeated load need not allocate another 1 KB snapshot.
+    }
     auto next = std::make_shared<GeClutState::Bytes>(state.data());
     if (const auto *source = memory.raw_pointer(address, count))
         std::memcpy(next->data(), source, count);
@@ -1902,6 +1909,7 @@ struct TextureSetup {
     std::uint32_t clut_start{};
     std::uint32_t clut_wrap_mask{};
     std::uint32_t clut_entry_bytes{};
+    std::uint32_t clut_bank{};
     bool swizzled{};
     bool clamp_u{};
     bool clamp_v{};
@@ -1932,6 +1940,8 @@ TextureSetup make_texture_setup_for_level(const psprecomp::GuestMemory &memory, 
     setup.clut_wrap_mask = setup.clut_format == 3u ? 0xFFu : 0x1FFu;
     setup.clut_entry_bytes = setup.clut_format == 3u ? 4u : 2u;
     setup.clut_base = clut_address(commands);
+    const bool separate=setup.format==4u && (data24(commands[0xC2u])&0x100u)!=0u;
+    setup.clut_bank=separate ? setup.selected_level*16u : 0u;
 
     const std::uint32_t row_bytes = setup.buffer_width * 4u;
     const std::uint64_t span = static_cast<std::uint64_t>(setup.height + 8u) * (row_bytes + 128u);
@@ -1980,48 +1990,14 @@ std::uint64_t texture_source_signature(const psprecomp::GuestMemory &memory,
     const std::uint8_t *pixels = memory.raw_pointer(texture.base, size);
     if (pixels == nullptr) return 0u;
 
-    std::uint64_t hash = 0x9E3779B97F4A7C15ull;
-    const auto mix64 = [&hash](std::uint64_t value) noexcept {
-        hash ^= value + 0x9E3779B97F4A7C15ull + (hash << 6u) + (hash >> 2u);
-        hash *= 0xD6E8FEB86659FD93ull;
-        hash ^= hash >> 29u;
-    };
-    const auto hash_range = [&](std::size_t begin, std::size_t end) noexcept {
-        std::size_t i = begin;
-        while (i + 8u <= end) {
-            std::uint64_t word{};
-            std::memcpy(&word, pixels + i, sizeof(word));
-            mix64(word);
-            i += 8u;
-        }
-        if (i < end) {
-            std::uint64_t tail = 0u;
-            std::memcpy(&tail, pixels + i, end - i);
-            mix64(tail ^ (static_cast<std::uint64_t>(end - i) << 56u));
-        }
-    };
-    if (size <= 4096u) {
-        hash_range(0u, size);
-    } else {
-        constexpr std::size_t blocks = 16u;
-        constexpr std::size_t block_bytes = 64u;
-        for (std::size_t block = 0u; block < blocks; ++block) {
-            const std::size_t center = (size - 1u) * block / (blocks - 1u);
-            const std::size_t begin = center > block_bytes / 2u ? center - block_bytes / 2u : 0u;
-            hash_range(begin, std::min(size, begin + block_bytes));
-        }
-    }
-    hash ^= static_cast<std::uint64_t>(size) +
-            (static_cast<std::uint64_t>(texture.width) << 32u) + texture.height;
-    hash *= 1099511628211ull;
-    return hash == 0u ? 1u : hash;
+    return ge_hash_all_bytes(pixels,size);
+
 }
 
 Color read_clut_fast(const psprecomp::GuestMemory &memory,
                      const TextureSetup &texture, std::uint32_t raw_index) {
-    const std::uint32_t index =
-        (((raw_index >> texture.clut_shift) & texture.clut_mask) |
-         (texture.clut_start & texture.clut_wrap_mask)) & texture.clut_wrap_mask;
+    const std::uint32_t index = ge_palette_index(raw_index,texture.clut_shift,
+        texture.clut_mask,texture.clut_start,texture.clut_wrap_mask,texture.clut_bank);
     const std::uint32_t offset = index * texture.clut_entry_bytes;
     if (texture.clut_pixels != nullptr) {
         const std::uint8_t *entry = texture.clut_pixels + offset;
@@ -4157,8 +4133,27 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         gpu_draw.vertex_count = count;
 
         gpu_draw.clut_checksum = 0u;
+        gpu_draw.palette_signature = 0u;
+        gpu_draw.texture_clut_shared = (data24(commands[0xC2u]) & 0x100u)==0u;
         if (gpu_draw.texture_enabled && gpu_draw.texture_format >= 4u && gpu_draw.texture_format <= 7u) {
             gpu_draw.clut_checksum = transform.clut.checksum;
+#if defined(__ANDROID__)
+            struct PaletteKeyCache {
+                std::shared_ptr<const GeClutState::Bytes> bytes;
+                std::array<std::uint32_t,7> mode{};
+                std::uint64_t hash{};
+            };
+            static thread_local PaletteKeyCache palette_key;
+            const auto levels=gpu_draw.texture_mipmap_enabled ? gpu_draw.texture_max_level+1u:1u;
+            const std::array<std::uint32_t,7> mode{gpu_draw.texture_format,gpu_draw.clut_format,
+                gpu_draw.clut_shift,gpu_draw.clut_mask,gpu_draw.clut_start,levels,gpu_draw.texture_clut_shared};
+            if (!palette_key.hash || palette_key.bytes!=transform.clut.snapshot || palette_key.mode!=mode) {
+                palette_key.bytes=transform.clut.snapshot;palette_key.mode=mode;
+                palette_key.hash=ge_palette_signature(transform.clut.data(),mode[0],mode[1],
+                    mode[2],mode[3],mode[4],mode[5],mode[6]!=0u);
+            } else ++g_ge_palette_key_hits;
+            gpu_draw.palette_signature=palette_key.hash;
+#endif
             ++g_ge_palette_draws;
         }
         ge_gpu_backend_prepare_texture_keys(gpu_draw);
@@ -4687,13 +4682,24 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         std::array<bool, 256> reuse_valid{};
         const bool reuse_indexed = gpu_backend_enabled && layout.index_type != 0u;
         // Material/light state is identical for all vertices in this primitive.
-        const PreparedLighting primitive_lighting = prepare_lighting(layout.color_type >= 4u, commands);
+        static thread_local PreparedLighting primitive_lighting;
+        static thread_local std::uint64_t prepared_light_revision{};
+        static thread_local bool prepared_vertex_color{};
         static thread_local VertexLightingCache primitive_light_cache;
-        primitive_light_cache.begin(primitive_lighting);
+        if (lighting_state_revision==0 || prepared_light_revision!=lighting_state_revision ||
+            prepared_vertex_color!=(layout.color_type>=4u)) {
+            primitive_lighting=prepare_lighting(layout.color_type>=4u,commands);
+            prepared_light_revision=lighting_state_revision;
+            prepared_vertex_color=layout.color_type>=4u;
+            primitive_light_cache.begin(primitive_lighting);
+        }
         static thread_local GeVertexMemo<Vertex> primitive_vertex_cache;
-        primitive_vertex_cache.begin();
+        // Camera/vertex revision covers matrices, materials, lighting, morph,
+        // UV and fog. Full record comparisons also detect same-address writes.
+        if (primitive_vertex_cache.begin_state(camera_state_revision,layout.type))
+            ++g_ge_vertex_states_reused;
         const bool memo_enabled = gpu_backend_enabled && layout.index_type==0u &&
-            !layout.through && count>=12u && layout.stride<=64u &&
+            !layout.through && count>=6u && layout.stride<=64u &&
             (primitive_lighting.enabled || layout.weight_type!=0u || layout.morph_count>1u);
 #if defined(__ANDROID__)
         const float primitive_x_scale = layout.through ? 1.0f : android_ultrawide_x_scale();
@@ -4985,6 +4991,7 @@ GePhaseTotals ge_phase_totals() noexcept {
         g_ge_gpu_stage_ns, g_ge_triangle_prep_ns, g_ge_gpu_accumulate_ns,
         g_ge_primitive_count, g_ge_vertex_count,
         g_ge_memo_hits, g_ge_clut_loads, g_ge_texture_matrix_words, g_ge_palette_draws,
+        g_ge_vertex_states_reused, g_ge_clut_noops, g_ge_palette_key_hits,
     };
 }
 
@@ -5000,6 +5007,7 @@ void reset_ge_phase_totals() noexcept {
     g_ge_primitive_count = 0u;
     g_ge_vertex_count = 0u;
     g_ge_memo_hits=g_ge_clut_loads=g_ge_texture_matrix_words=g_ge_palette_draws=0;
+    g_ge_vertex_states_reused=g_ge_clut_noops=g_ge_palette_key_hits=0;
 }
 
 }

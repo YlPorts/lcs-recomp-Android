@@ -8,8 +8,17 @@ template<class Vertex> class GeVertexMemo {
         std::array<std::uint8_t,64> bytes{}; Vertex vertex{}; };
     std::array<Entry,256> slots_{};
     std::uint32_t generation_{};
+    std::uint64_t state_revision_{};
+    std::uint32_t layout_{};
 public:
+    bool begin_state(std::uint64_t revision, std::uint32_t layout) noexcept {
+        const bool reused=revision!=0 && revision==state_revision_ && layout==layout_;
+        if (!reused) begin();
+        state_revision_=revision;layout_=layout;
+        return reused;
+    }
     void begin() noexcept {
+        state_revision_=0;
         if (++generation_ == 0) {
             for (auto &s:slots_) s.generation=0;
             generation_=1;

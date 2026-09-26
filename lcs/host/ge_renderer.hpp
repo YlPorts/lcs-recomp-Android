@@ -120,6 +120,7 @@ struct GePhaseTotals {
     std::uint64_t primitives{};
     std::uint64_t vertices{};
     std::uint64_t memo_hits{}, clut_loads{}, texture_matrix_words{}, palette_draws{};
+    std::uint64_t vertex_states_reused{}, clut_noops{}, palette_key_hits{};
 };
 void flush_ge_deferred_rasterization(psprecomp::GuestMemory &memory);
 

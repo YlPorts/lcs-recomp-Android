@@ -233,5 +233,60 @@ int main(){
     assert(ge_gpu_backend_finish_color_frame(9999));
     assert(pixel(5,8)[0]==0 && pixel(5,8)[1]==0 && pixel(5,8)[2]==0);
     std::cout<<"PASS: ordered overlapping programmable-blend triangles, coherentFetch="<<s.framebuffer_fetch_enabled<<"\n";
+
+    // Fixed PSP LOD must select the requested mip even for a magnified quad.
+    auto mip=color;mip.texture_enabled=true;mip.texture_format=3;
+    mip.texture_function=3;mip.texture_use_alpha=true;mip.texture_address=0x088f0000;
+    mip.texture_width=mip.texture_height=mip.texture_buffer_width=2;
+    mip.texture_max_level=1;mip.texture_mipmap_enabled=true;mip.texture_clamp_u=mip.texture_clamp_v=true;
+    mip.texture_level_addresses[0]=mip.texture_address;mip.texture_level_addresses[1]=mip.texture_address+16;
+    mip.texture_level_widths[0]=mip.texture_level_heights[0]=mip.texture_level_buffer_widths[0]=2;
+    mip.texture_level_widths[1]=mip.texture_level_heights[1]=mip.texture_level_buffer_widths[1]=1;
+    mip.texture_content_signature=998877;
+    ge_gpu_backend_prepare_texture_keys(mip);ge_gpu_backend_record_draw(mip);
+    std::vector<std::byte> levels;
+    for(unsigned n=0;n<4;n++)for(auto byte:red)levels.push_back(byte);
+    for(auto byte:blue)levels.push_back(byte);
+    assert(ge_gpu_backend_upload_decoded_texture_chain_packed(mip,2,2,2,levels));
+    auto mip1=mip;mip1.texture_level_mode=1;mip1.texture_level_offset16=16;
+    ge_gpu_backend_prepare_texture_keys(mip1);
+    assert(texture_key(mip1)==texture_key(mip)); // same image, distinct sampling
+    const auto images=s.textures.size();assert(!ge_gpu_backend_texture_needed(mip1));
+    clear_target();ge_gpu_backend_accumulate_color_triangles(mip1,quad(0,0,16,16,2,2));
+    assert(ge_gpu_backend_finish_color_frame(10001));assert(pixel(8,8)[2]==255 && pixel(8,8)[0]==0);
+    mip.texture_level_mode=1;mip.texture_level_offset16=0;
+    clear_target();ge_gpu_backend_accumulate_color_triangles(mip,quad(0,0,8,16,2,2));
+    ge_gpu_backend_accumulate_color_triangles(mip1,quad(8,0,16,16,2,2));
+    assert(s.batches.size()==2); // LOD changes cannot be merged
+    assert(ge_gpu_backend_finish_color_frame(10002));
+    assert(pixel(3,8)[0]==255 && pixel(12,8)[2]==255);
+    auto filtering=mip;filtering.texture_min_linear=true;filtering.texture_clamp_u=false;
+    ge_gpu_backend_prepare_texture_keys(filtering);
+    assert(texture_key(mip)==texture_key(filtering) && s.textures.size()==images);
+    std::cout<<"PASS: actual fixed LOD red/blue mips, adjacent LOD barriers, shared image across sampler changes\n";
+    // Identical geometry reuses three allocations, not endless orphan buffers.
+    for(unsigned i=0;i<6;i++){
+        ge_gpu_backend_accumulate_color_triangles(mip,quad(0,0,16,16,2,2));
+        assert(ge_gpu_backend_finish_color_frame(11000+i));
+    }
+    const auto allocations=s.geometry_allocations;
+    for(unsigned i=0;i<100;i++){
+        ge_gpu_backend_accumulate_color_triangles(mip,quad(0,0,16,16,2,2));
+        assert(ge_gpu_backend_finish_color_frame(12000+i));
+        assert(pixel(8,8)[0]==255);
+    }
+    assert(s.geometry_allocations==allocations);
+    for(const auto &slot:s.geometry_slots) assert(slot.vertex_capacity && slot.indices && slot.vertices);
+    assert(sizeof(GlesStreamVertex)==36);
+    std::cout<<"PASS: 100 real fenced triple-buffer reuses with identical readback; no extra geometry allocation; 36-byte float vertex\n";
+    // Current-frame textures must survive budget pressure. Prune only old images.
+    auto keep_budget=s.texture_cache_byte_limit;auto keep_entries=s.texture_cache_entry_limit;
+    s.texture_cache_entry_limit=2;
+    for(auto &[key,image]:s.textures)image.last_used_epoch=s.frame_epoch;
+    auto pinned=s.textures.size();trim_texture_cache(s,true);assert(s.textures.size()==pinned);
+    ++s.frame_epoch;trim_texture_cache(s,true);assert(s.textures.size()<=2);
+    s.texture_cache_byte_limit=keep_budget;s.texture_cache_entry_limit=keep_entries;
+    assert(glGetError()==GL_NO_ERROR);
+    std::cout<<"PASS: sorted budget eviction preserves pending-frame textures; no GL errors\n";
     destroy_backend(s);
 }

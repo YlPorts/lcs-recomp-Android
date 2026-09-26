@@ -8,11 +8,11 @@ bridge=(root/'android/app/src/main/cpp/android_bridge.cpp').read_text()
 assert 'native int nativeRun(String gameRoot, String configPath, int renderScale)' in java
 assert 'nativeRun(gameRoot, configPath, renderScale())' in java
 assert '"InternalScale=" + renderScale()' in java
-assert 'getInt("render_scale", 2)' in java
+assert 'getInt("render_scale", 1)' in java
 assert 'putInt("render_scale", scale)' in java
 assert 'jint render_scale)' in bridge
 assert 'const bool scale2 = render_scale == 2;' in bridge
 assert 'setenv("PSPRECOMP_GLES_SCALE", scale2 ? "2" : "1", 1);' in bridge
-assert 'versionName "0.6.12"' in (root/'android/app/build.gradle').read_text()
-assert 'LCS Android 0.6.12' in (root/'lcs/host/lcs_android_build.cpp').read_text()
-print('PASS: persisted 1x/2x launcher -> JNI -> internal scale config; default 2x; native version 0.6.12')
+assert 'versionName "0.6.13"' in (root/'android/app/build.gradle').read_text()
+assert 'LCS Android 0.6.13' in (root/'lcs/host/lcs_android_build.cpp').read_text()
+print('PASS: persisted 1x/2x launcher -> JNI -> internal scale config; default 1x; existing preference retained; native version 0.6.13')

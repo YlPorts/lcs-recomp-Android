@@ -38,6 +38,8 @@ struct GeGpuDrawDescriptor {
     std::uint32_t clut_mask{};
     std::uint32_t clut_start{};
     std::uint32_t clut_checksum{};
+    std::uint64_t palette_signature{};
+    bool texture_clut_shared{true};
     std::uint64_t texture_content_signature{};
     std::uint64_t texture_cache_key_hint{};
     std::uint64_t texture_image_key_hint{};

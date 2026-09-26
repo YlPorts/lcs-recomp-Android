@@ -687,7 +687,7 @@ public final class MainActivity extends Activity {
     }
 
     private int renderScale() {
-        int scale = getSharedPreferences("graphics", MODE_PRIVATE).getInt("render_scale", 2);
+        int scale = getSharedPreferences("graphics", MODE_PRIVATE).getInt("render_scale", 1);
         return scale == 2 ? 2 : 1;
     }
 

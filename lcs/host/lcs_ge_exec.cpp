@@ -1,6 +1,7 @@
 #include "lcs_ge_exec.hpp"
 
 #include "ge_renderer.hpp"
+#include "lcs_ge_state_policy.hpp"
 #if defined(__ANDROID__)
 #include "lcs_android_gpu_policy.hpp"
 #endif
@@ -20,7 +21,7 @@ std::uint32_t ge_base_register = 0u;
 std::uint32_t ge_offset_address = 0u;
 std::uint32_t ge_vertex_address = 0u;
 std::uint32_t ge_index_address = 0u;
-std::uint64_t ge_state_revision = 1u;
+GeStateRevisions ge_revisions;
 bool ge_finish_seen = false;
 std::uint32_t ge_finish_arg = 0u;
 
@@ -37,6 +38,7 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
     ge_finish_seen = false;
     ge_finish_arg = 0u;
     if (list_address == 0u) return;
+    ge_revisions.begin_list();
 #if defined(__ANDROID__)
     // New list: revalidate content but keep images pinned by queued draws.
     android_gles_texture_barrier();
@@ -58,8 +60,7 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
         const std::uint32_t command = word >> 24u;
         const std::uint32_t data = word & 0x00FFFFFFu;
         // Matrix data consumes cursors even if consecutive words are equal.
-        if (command >= 0x12u && (ge_commands[command] != data ||
-            (command >= 0x2Au && command <= 0x41u))) ++ge_state_revision;
+        ge_revisions.update(command, ge_commands[command] != data);
         ge_commands[command] = data;
 
         if (command >= 0x2Au && command <= 0x41u)
@@ -126,7 +127,7 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
             GeRenderStats stats{};
             std::string error;
             if (!render_ge_primitive(memory, ge_commands, ge_transform, ge_vertex_address,
-                                     ge_index_address, data, stats, error, 1u, ge_state_revision, ge_state_revision, ge_state_revision,
+                                     ge_index_address, data, stats, error, 1u, ge_revisions.draw, ge_revisions.vertex, ge_revisions.lighting,
                                      diag)) {
                 if (diag)
                     std::cerr << "[ge-render] primitive failed at " << psprecomp::hex32(op_pc)

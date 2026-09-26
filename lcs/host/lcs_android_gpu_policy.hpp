@@ -15,6 +15,12 @@ class TextureVersions {
     std::unordered_map<std::uint64_t, Entry> entries_;
 public:
     void clear() noexcept { entries_.clear(); }
+    std::size_t size() const noexcept {return entries_.size();}
+    template<class Keep> void retain(Keep keep) {
+        for(auto it=entries_.begin();it!=entries_.end();)
+            if(!keep(it->first,it->second.signature)) it=entries_.erase(it);
+            else ++it;
+    }
     void observe(std::uint64_t base, std::uint64_t signature, std::uint64_t epoch) {
         if (signature != 0u) entries_[base] = Entry{signature, epoch};
     }
