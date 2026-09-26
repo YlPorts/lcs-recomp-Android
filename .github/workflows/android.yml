@@ -26,8 +26,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Apply checked 0.6.10 source update
-        run: python3 android/tools/repair_0610.py
+      - name: Apply checked 0.6.11 source update
+        run: python3 android/tools/repair_0611.py
       - name: Component and audio regression tests
         run: |
           mkdir -p android/test-results
@@ -47,14 +47,20 @@ jobs:
           /tmp/vertex-bytes | tee android/test-results/vertex-bytes.txt
           g++ -std=c++20 -O1 -g -fsanitize=address,undefined -ffunction-sections -fdata-sections -Iinclude -Ilcs/host android/tests/vertex_bytes_regression.cpp src/guest_memory.cpp -Wl,--gc-sections -pthread -o /tmp/vertex-bytes-san
           /tmp/vertex-bytes-san | tee android/test-results/vertex-bytes-sanitized.txt
+      - name: Exact lighting cache regression
+        run: |
+          g++ -std=c++20 -O2 -ffunction-sections -fdata-sections -Iinclude -Ilcs/host android/tests/lighting_cache_regression.cpp src/guest_memory.cpp -Wl,--gc-sections -pthread -o /tmp/lighting-cache
+          /tmp/lighting-cache | tee android/test-results/lighting-cache.txt
       - name: Install graphics test dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y glslang-tools ccache libegl1-mesa-dev libgles2-mesa-dev
       - name: Actual GLES backend regression tests
         run: |
-          g++ -std=c++20 -O2 -D__ANDROID__ -Iandroid/tests/shim -Iandroid/app/src/main/cpp -Ilcs/host android/tests/gles_backend_integration.cpp -pthread -lEGL -lGLESv2 -o /tmp/gles-backend
-          /tmp/gles-backend | tee android/test-results/gles-backend.txt
+          g++ -std=c++20 -O2 -ffunction-sections -fdata-sections -Iinclude -Ilcs/host -c android/tests/reference_fragments.cpp -o /tmp/reference-fragments.o
+          g++ -std=c++20 -O2 -D__ANDROID__ -Iandroid/tests/shim -Iandroid/app/src/main/cpp -Ilcs/host android/tests/gles_backend_integration.cpp lcs/host/lcs_android_build.cpp /tmp/reference-fragments.o -Wl,--gc-sections -pthread -lEGL -lGLESv2 -o /tmp/gles-backend
+          /tmp/gles-backend | tee android/test-results/gles-backend-fetch.txt
+          PSPRECOMP_GLES_FB_FETCH=0 /tmp/gles-backend | tee android/test-results/gles-backend-copy.txt
           python3 android/tests/gles_smoke.py | tee android/test-results/shader-readback.txt
       - name: Validate shader sources
         run: |
@@ -84,22 +90,22 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -u
-          git add android/app/src/main/assets/licenses/FFmpeg-LGPL-2.1.txt android/REPAIR_0610.md android/tests/vertex_bytes_regression.cpp android/tests/media_regression.cpp android/tools/build_ffmpeg.sh android/FFMPEG.md
+          git add lcs/host/lcs_android_build.cpp lcs/host/lcs_android_build.hpp android/REPAIR_0611.md android/tests/lighting_cache_regression.cpp android/tests/reference_fragments.cpp android/tests/verify_apk.py
           if ! git diff --cached --quiet; then
-            git commit -m "Apply tested Android 0.6.10 clip-space submission and real ATRAC decoder [skip ci]"
+            git commit -m "Apply tested Android 0.6.11 exact blend, lighting cache and native identity fixes [skip ci]"
             git push origin HEAD:android-port
           fi
       - name: Record exact source
         run: |
           git rev-parse HEAD > android/test-results/source-commit.txt
-          git archive --format=tar.gz -o /tmp/LCSRecomp-Android-0.6.10-source.tar.gz HEAD
+          git archive --format=tar.gz -o /tmp/LCSRecomp-Android-0.6.11-source.tar.gz HEAD
           git -C android/.deps/ffmpeg-source archive --prefix=FFmpeg-7.1.5/ --format=tar.gz -o /tmp/LCS-FFmpeg-7.1.5-source.tar.gz HEAD
       - name: Upload source and tests
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.10-source-and-tests
+          name: LCSRecomp-Android-0.6.11-source-and-tests
           path: |
-            /tmp/LCSRecomp-Android-0.6.10-source.tar.gz
+            /tmp/LCSRecomp-Android-0.6.11-source.tar.gz
             /tmp/LCS-FFmpeg-7.1.5-source.tar.gz
             android/test-results/
       - name: Java 17
@@ -145,6 +151,10 @@ jobs:
             lcs-android-ccache-${{ runner.os }}-
       - name: Build ARM64 debug APK
         run: gradle -p android :app:assembleDebug --no-daemon --max-workers=2 --stacktrace
+      - name: Verify native build identity and media dependencies
+        run: |
+          python3 android/tests/verify_apk.py android/app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs android/app/build/outputs/apk/debug/app-debug.apk
       - name: Save native compiler cache
         if: always() && steps.ccache.outputs.cache-primary-key != ''
         uses: actions/cache/save@v5
@@ -157,12 +167,15 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.10-arm64-debug
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: LCSRecomp-Android-0.6.11-arm64-debug
+          path: |
+            android/app/build/outputs/apk/debug/app-debug.apk
+            android/app/build/outputs/apk/debug/app-debug.apk.sha256
+            android/app/build/outputs/apk/debug/build-identity.txt
           if-no-files-found: error
       - name: Upload test results on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.10-failed-test-results
+          name: LCSRecomp-Android-0.6.11-failed-test-results
           path: android/test-results/
