@@ -1,4 +1,5 @@
 #include "ge_gpu_backend.hpp"
+#include "lcs_ge_triangle_indices.hpp"
 
 #if defined(__ANDROID__)
 
@@ -83,6 +84,7 @@ struct GlesState {
     std::thread::id gl_thread{};
     std::uint32_t scale{2u};
     std::uint64_t frame_epoch{1u};
+    std::uint64_t merged_clip_batches{};
     std::uint64_t validation_epoch{1u};
     std::unordered_map<std::uint32_t, GLuint> samplers;
     std::array<std::uint32_t,16> pixel_uniform_key{};
@@ -1950,36 +1952,54 @@ bool gles_draw_state_compatible(
 
 
 bool ge_gpu_backend_accumulate_clip_vertices(const GeGpuDrawDescriptor &input_draw,
-    const GeGpuClipViewport &viewport,std::span<const GeGpuVertex> vertices) noexcept {
+    const GeGpuClipViewport &viewport, std::span<const GeGpuVertex> vertices) noexcept {
     auto &s=state();
     const char *setting=std::getenv("PSPRECOMP_GLES_CLIP");
     if (!s.enabled || (setting && std::strcmp(setting,"0")==0) || vertices.empty()) return false;
-    const auto draw=snapshot_texture_draw(input_draw);
-    if (draw.primitive<3u || draw.primitive>5u || draw.through || draw.clear_mode) return false;
+    auto draw=snapshot_texture_draw(input_draw);
+    const auto primitive=draw.primitive;
+    if (primitive<3u || primitive>5u || draw.through || draw.clear_mode) return false;
+    if (vertices.size()>1048576u) return false;
     if (viewport.requires_inside_depth) {
         for (const auto &v : vertices)
             if (!std::isfinite(v.x+v.y+v.z+v.w) || !(v.w>0) || v.z < -v.w || v.z > v.w)
-                return false; // No draw consumed; CPU route retains PSP depth behaviour.
+                return false;
+    }
+    if (vertices.size()<3u) return true;
+    // All model transforms are already applied. Shared viewport/material draws
+    // can therefore be merged without regrouping objects or changing draw order.
+    // Explicit triangle indices preserve boundaries, strip winding and flat colour.
+    draw.primitive=3u;
+    GlesBatch fresh{};
+    GlesBatch *destination=&fresh;
+    const char *merge=std::getenv("PSPRECOMP_GLES_MERGE_CLIP");
+    if (!(merge && std::strcmp(merge,"0")==0) && !s.batches.empty()) {
+        auto &last=s.batches.back();
+        if (last.clip_coordinates && last.draw.primitive==3u && !last.indices.empty() &&
+            last.clip_viewport==viewport && gles_draw_state_compatible(last.draw,draw) &&
+            last.vertices.size()+vertices.size()<=1048576u) destination=&last;
     }
     try {
-        GlesBatch batch{};
-        batch.draw=draw;batch.clip_coordinates=true;batch.clip_viewport=viewport;
-        batch.vertices.assign(vertices.begin(),vertices.end());
-        if (draw.texture_enabled && draw.texture_width && draw.texture_height) {
-            const float iw=1.0f/draw.texture_width,ih=1.0f/draw.texture_height;
-            for (auto &v:batch.vertices) { v.u*=iw;v.v*=ih; }
+        const std::uint32_t base=static_cast<std::uint32_t>(destination->vertices.size());
+        const auto count=static_cast<std::uint32_t>(vertices.size());
+        const std::size_t indices=primitive==3u ? (count/3u)*3u : (count-2u)*3u;
+        // Reserve both before modifying sizes, so allocation failure consumes no draw.
+        const auto reserve_growing=[](auto &buffer, std::size_t required) {
+            if (required>buffer.capacity()) buffer.reserve(std::max(required,buffer.capacity()*2u));
+        };
+        reserve_growing(destination->vertices,static_cast<std::size_t>(base)+count);
+        reserve_growing(destination->indices,destination->indices.size()+indices);
+        destination->vertices.insert(destination->vertices.end(),vertices.begin(),vertices.end());
+        const float iw=draw.texture_enabled && draw.texture_width ? 1.0f/draw.texture_width : 1.0f;
+        const float ih=draw.texture_enabled && draw.texture_height ? 1.0f/draw.texture_height : 1.0f;
+        for (std::size_t i=base;i<destination->vertices.size();++i) {
+            destination->vertices[i].u*=iw;destination->vertices[i].v*=ih;
         }
-        // Merge independent triangle lists only. Strips/fans require explicit
-        // boundaries; concatenation would invent bridging triangles.
-        if (draw.primitive==3u && !s.batches.empty()) {
-            auto &last=s.batches.back();
-            if (last.clip_coordinates && last.draw.primitive==3u &&
-                last.clip_viewport==viewport && gles_draw_state_compatible(last.draw,draw)) {
-                last.vertices.insert(last.vertices.end(),batch.vertices.begin(),batch.vertices.end());
-                return true;
-            }
-        }
-        s.batches.push_back(std::move(batch));
+        append_ge_triangle_indices(destination->indices,primitive,count,base);
+        if (destination==&fresh) {
+            fresh.draw=draw;fresh.clip_coordinates=true;fresh.clip_viewport=viewport;
+            s.batches.push_back(std::move(fresh));
+        } else ++s.merged_clip_batches;
         return true;
     } catch (...) { return false; }
 }
@@ -2207,6 +2227,8 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
             " colorTestDraws=" + std::to_string(s.perf_color_tests)+
             " gpuClipDraws="+std::to_string(s.perf_clip_draws)+
             " gpuClipVertices="+std::to_string(s.perf_clip_vertices)+
+            " mergedClip="+std::to_string(s.merged_clip_batches)+
+            " renderScale="+std::to_string(s.scale)+
             " blendFetch="+std::to_string(s.framebuffer_fetch_enabled ? 1 : 0)+
             " blendFallbacks="+std::to_string(s.perf_blend_fallbacks)+
             " missingTextures="+std::to_string(s.perf_missing_textures)+
@@ -2219,6 +2241,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
         s.perf_blend_equations.fill(0);
         s.perf_blend_fallbacks=s.perf_missing_textures=0;
         s.perf_clip_draws=s.perf_clip_vertices=0;
+        s.merged_clip_batches=0;
         s.perf_presents = s.perf_epochs = s.perf_color_tests = 0;
         s.perf_window = perf_now;
     }
@@ -2247,6 +2270,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
                          " cpuSubmitMs=" + std::to_string(average_ms) +
                          " targets=" + std::to_string(s.targets.size()) +
                          " textures=" + std::to_string(s.textures.size()) +
+                         " render=" + std::to_string(s.report.offscreen_width) + "x" + std::to_string(s.report.offscreen_height) +
                          " cacheMB=" + std::to_string(
                              s.texture_cache_bytes / (1024u * 1024u)) +
                          " draws=" + std::to_string(s.report.game_draw_calls) +

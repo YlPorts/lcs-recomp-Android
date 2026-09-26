@@ -133,6 +133,65 @@ int main(){
     std::cout<<"PASS: actual flat shading, winding and depth clipping; no GL errors\n";
 
 
+    // Compare explicit indices and adjacent merging against native GL lists,
+    // strips and fans (the previous path), not against a second use of the new converter.
+    unsigned merged_images=0;
+    for (unsigned primitive=3;primitive<=5;++primitive)
+    for (unsigned test=0;test<40;++test) {
+        auto d=color;d.primitive=primitive;
+        auto viewport=vp;viewport.flat_shading=(test&1)!=0;
+        viewport.cull_enabled=(test%3)!=0;
+        viewport.accept_counter_clockwise=(test%3)==2;
+        d.blend_enabled=(test%4)==0;d.blend_equation=0;
+        d.blend_source_factor=2;d.blend_dest_factor=3;
+        std::array<GeGpuVertex,6> a{},b{};
+        for(unsigned n=0;n<a.size();++n) {
+            a[n].x=-.95f+float(n%2)*.9f+float(test%5)*.03f;
+            a[n].y=-.9f+float(n/2)*.6f;
+            a[n].w=1.0f;a[n].z=.2f;
+            a[n].rgba=0x800000ffu+(n*35u<<8)+(n*19u<<16);
+            b[n]=a[n];b[n].x+=.9f;b[n].y-=.15f;b[n].rgba^=0x00ffffffu;
+        }
+        clear_target();
+        for (const auto *verts:{&a,&b}) {
+            GlesBatch raw{};raw.draw=d;raw.clip_coordinates=true;raw.clip_viewport=viewport;
+            raw.vertices.assign(verts->begin(),verts->end());s.batches.push_back(std::move(raw));
+        }
+        assert(ge_gpu_backend_finish_color_frame(400+test));auto reference=read_all();
+        clear_target();
+        assert(ge_gpu_backend_accumulate_clip_vertices(d,viewport,a));
+        assert(ge_gpu_backend_accumulate_clip_vertices(d,viewport,b));
+        assert(s.batches.size()==1 && !s.batches[0].indices.empty());
+        assert(ge_gpu_backend_finish_color_frame(450+test));auto actual=read_all();
+        assert(reference==actual);++merged_images;
+    }
+    std::cout<<"PASS: "<<merged_images<<" actual merged list/strip/fan images equal native GL primitive reference, flat colour, winding, blend overlap and boundaries\n";
+
+    // A 2x target must really allocate four times as many pixels, while logical
+    // coordinates/UV and uploaded texture contents remain unchanged.
+    s.scale=2;
+    auto doubled=color;
+    auto left=quad(0,0,8,16),right=quad(8,0,16,16);
+    for(auto &v:left)v.rgba=0xff0000ff;
+    for(auto &v:right)v.rgba=0xffff0000;
+    ge_gpu_backend_accumulate_color_triangles(doubled,left);
+    ge_gpu_backend_accumulate_color_triangles(doubled,right);
+    assert(ge_gpu_backend_finish_color_frame(490));
+    const auto &rt=s.targets.at(0x10000u);
+    assert(rt.render_width==32 && rt.render_height==32);
+    assert((pixel(7,16)==std::array<unsigned char,4>{255,0,0,255}));
+    assert((pixel(24,16)==std::array<unsigned char,4>{0,0,255,255}));
+    // Flip back without retaining a stale size/sampler or invalid FBO.
+    s.scale=1;
+    ge_gpu_backend_accumulate_color_triangles(doubled,left);
+    ge_gpu_backend_accumulate_color_triangles(doubled,right);
+    assert(ge_gpu_backend_finish_color_frame(491));
+    assert(rt.render_width==16 && rt.render_height==16);
+    assert((pixel(3,8)==std::array<unsigned char,4>{255,0,0,255}));
+    assert((pixel(12,8)==std::array<unsigned char,4>{0,0,255,255}));
+    assert(glGetError()==GL_NO_ERROR);
+    std::cout<<"PASS: actual 1x -> 2x -> 1x FBO sizes and identical logical scene; no GL errors\n";
+
     // The old backend silently disabled every unrecognized blend pair. Compare
     // every supported PSP factor/equation against the ACTUAL software blender.
     unsigned blend_cases=0;

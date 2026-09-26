@@ -137,7 +137,7 @@ Java_com_ylports_lcsrecomp_MainActivity_nativeGetDebugStatus(
 
 extern "C" JNIEXPORT jint JNICALL
 Java_com_ylports_lcsrecomp_MainActivity_nativeRun(
-    JNIEnv *env, jclass, jstring game_root_text, jstring config_path_text) {
+    JNIEnv *env, jclass, jstring game_root_text, jstring config_path_text, jint render_scale) {
     const std::string game_root = from_jstring(env, game_root_text);
     const std::string config_path = from_jstring(env, config_path_text);
     if (game_root.empty()) return 2;
@@ -161,15 +161,16 @@ Java_com_ylports_lcsrecomp_MainActivity_nativeRun(
     // making the experimental hardware-transform path the prime suspect.
     setenv("PSPRECOMP_GE_GPU_HW_TRANSFORM", "0", 1);
     setenv("PSPRECOMP_GE_DIRECT_NONINDEXED_DRAW", "1", 1);
-    setenv("PSPRECOMP_GLES_SCALE", "1", 1);
+    const bool scale2 = render_scale == 2;
+    setenv("PSPRECOMP_GLES_SCALE", scale2 ? "2" : "1", 1);
     setenv("PSPRECOMP_GLES_CLIP", "1", 1);
     // LCS_FPS_CAP throttles changing GE LIST addresses, not finished frames.
     // A game frame contains several lists; keep only the existing vblank
     // real-time pacing instead of sleeping 16.67 ms per list as well.
     setenv("LCS_FPS_CAP", "0", 1);
     unsetenv("LCS_UNCAPPED");
-    setenv("PSPRECOMP_INTERNAL_WIDTH", "480", 1);
-    setenv("PSPRECOMP_INTERNAL_HEIGHT", "272", 1);
+    setenv("PSPRECOMP_INTERNAL_WIDTH", scale2 ? "960" : "480", 1);
+    setenv("PSPRECOMP_INTERNAL_HEIGHT", scale2 ? "544" : "272", 1);
     setenv("PSPRECOMP_AUDIO", "1", 1);
 
     // ATRAC3/ATRAC3+ streams now use FFmpeg. Keep the separate PMF movie path

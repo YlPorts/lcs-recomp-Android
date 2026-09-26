@@ -2131,7 +2131,11 @@ void android_pipeline_report() {
         <<" clipMs="<<ms(phase.triangle_prep_ns,previous.triangle_prep_ns)
         <<" batchMs="<<ms(phase.gpu_accumulate_ns,previous.gpu_accumulate_ns)
         <<" prims="<<(phase.primitives-previous.primitives)
-        <<" vertices="<<(phase.vertices-previous.vertices);
+        <<" vertices="<<(phase.vertices-previous.vertices)
+        <<" vertexMemoHits="<<(phase.memo_hits-previous.memo_hits)
+        <<" clutLoads="<<(phase.clut_loads-previous.clut_loads)
+        <<" texMatrixWords="<<(phase.texture_matrix_words-previous.texture_matrix_words)
+        <<" paletteDraws="<<(phase.palette_draws-previous.palette_draws);
     runtime_log_line(report.str());
     previous=phase;before_ge=ge;before_gpu=gpu;before_wait=wait;frames=0;started=now;
 }

@@ -62,7 +62,7 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
             (command >= 0x2Au && command <= 0x41u))) ++ge_state_revision;
         ge_commands[command] = data;
 
-        if (command >= 0x2Au && command <= 0x3Fu)
+        if (command >= 0x2Au && command <= 0x41u)
             update_ge_transform_state(ge_transform, command, data);
 
         switch (command) {
@@ -106,7 +106,16 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
                               << " written=" << total_pixels_written << "\n";
             }
             return;
-        case 0xC4u:  // CLUTLOAD
+        case 0xC4u: { // CLUTLOAD copies bytes into the GE internal palette.
+            flush_ge_deferred_rasterization(memory);
+            const std::uint32_t address = (ge_commands[0xB0u] & 0x00FFFFF0u) |
+                ((ge_commands[0xB1u] << 8u) & 0x0F000000u);
+            load_ge_clut(ge_transform.clut, memory, address, data);
+#if defined(__ANDROID__)
+            android_gles_texture_barrier();
+#endif
+            break;
+        }
         case 0xCBu:  // TEXFLUSH
         case 0xCCu:  // TEXSYNC
 #if defined(__ANDROID__)

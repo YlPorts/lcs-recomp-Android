@@ -1,0 +1,935 @@
+diff --git a/android/REPAIR_0612.md b/android/REPAIR_0612.md
+new file mode 100644
+index 0000000..587b6e3
+--- /dev/null
++++ b/android/REPAIR_0612.md
+@@ -0,0 +1,20 @@
++# Android 0.6.12
++
++Baseline: 2bd2ce61a3e155595c1eeb131cccd41b287aa6bb (0.6.11).
++
++## Changes
++- A persistent launcher 1x/2x toggle feeds both JNI and the render configuration. Default 2x for this requested comparison; returning to 1x is supported. This is internal target resolution, not just display scaling. Doubling each axis produces four times the pixel count and can lower FPS. The logged `render=` reports actual target size (which can differ from 480x272).
++- Execute texture matrix commands 0x40/0x41. The previous interpreter gated the transform update at 0x3F even though the transform helper supported 0x40/0x41. Repeated identical matrix data words must still advance the cursor.
++- Implement an immutable, 1024-byte internal CLUT snapshot on CLUTLOAD. Partial loads replace only the requested 32-byte blocks; zero-length loads do not erase the palette. Texture decoding and queued software draws retain the correct snapshot across later RAM writes. Cache identity includes the entire loaded palette, including upper 16-bit entries.
++- Merge adjacent compatible GPU clip-space lists, strips and fans using explicit triangle indices. Preserve primitive boundaries, winding, provoking vertex, draw order, texture versions and framebuffer feedback barriers. Do not sort by texture or join independent strips directly.
++- Exact per-primitive reuse of repeated non-indexed vertex records, limited to costly lighting/skinning/morph cases and records up to 64 bytes. Full byte comparisons reject hash collisions and changes; primitive boundaries invalidate the cache. No reduced precision or cross-frame reuse.
++- Add `mergedClip`, `renderScale`, `render`, `vertexMemoHits`, `clutLoads`, `texMatrixWords` and `paletteDraws` counters.
++- Keep the existing audio queue and ATRAC decoders, single GLES owner, vblank pacing and safe CPU fallbacks. No new claims of PMF support.
++
++## Regression coverage
++- Execute real GE lists through the command interpreter and inspect actual vertex/texture reader state. Verify texture matrix loads and CLUT lifetime with RAM overwrite, partial/zero loads, T4/T8/T16/T32 and upper 16-bit entries. The 0.6.11 executor fails the two new state tests.
++- 61,440 exact full-vertex comparisons with repeated/mutated records and changing primitive/material state; malformed record and failed decode behaviour. 300 index-conversion cases preserve boundaries and provoking vertices.
++- Actual GLES backend comparisons of merged lists/strips/fans against native GL primitive assembly, including flat shading, culling and alpha overlap. Actual 1x -> 2x -> 1x target-size/readback tests. Both coherent framebuffer fetch and ordered-copy paths run in CI on Mesa.
++- Existing component/audio, geometry, bounded vertex reader, lighting, shader, blending and real ATRAC decoding tests retained. New state and memo tests also run with AddressSanitizer/UndefinedBehaviorSanitizer.
++
++See artifacts for executed test outputs, not just this test plan. Host microbenchmarks are not Android or game FPS measurements. There is no physical-device result for this revision yet. Neither 60 sustained FPS nor complete elimination of green/flickering materials is certified. A GPU-rendered palette source that requires GPU-to-guest readback is not added by this CLUT change.
+diff --git a/android/app/build.gradle b/android/app/build.gradle
+index 5a909cf..eaa5a29 100644
+--- a/android/app/build.gradle
++++ b/android/app/build.gradle
+@@ -11,8 +11,8 @@ android {
+         applicationId "com.ylports.lcsrecomp"
+         minSdk 26
+         targetSdk 35
+-        versionCode 17
+-        versionName "0.6.11"
++        versionCode 18
++        versionName "0.6.12"
+ 
+         ndk {
+             abiFilters "arm64-v8a"
+diff --git a/android/app/src/main/cpp/android_bridge.cpp b/android/app/src/main/cpp/android_bridge.cpp
+index 611e67e..4e6398f 100644
+--- a/android/app/src/main/cpp/android_bridge.cpp
++++ b/android/app/src/main/cpp/android_bridge.cpp
+@@ -137,7 +137,7 @@ Java_com_ylports_lcsrecomp_MainActivity_nativeGetDebugStatus(
+ 
+ extern "C" JNIEXPORT jint JNICALL
+ Java_com_ylports_lcsrecomp_MainActivity_nativeRun(
+-    JNIEnv *env, jclass, jstring game_root_text, jstring config_path_text) {
++    JNIEnv *env, jclass, jstring game_root_text, jstring config_path_text, jint render_scale) {
+     const std::string game_root = from_jstring(env, game_root_text);
+     const std::string config_path = from_jstring(env, config_path_text);
+     if (game_root.empty()) return 2;
+@@ -161,15 +161,16 @@ Java_com_ylports_lcsrecomp_MainActivity_nativeRun(
+     // making the experimental hardware-transform path the prime suspect.
+     setenv("PSPRECOMP_GE_GPU_HW_TRANSFORM", "0", 1);
+     setenv("PSPRECOMP_GE_DIRECT_NONINDEXED_DRAW", "1", 1);
+-    setenv("PSPRECOMP_GLES_SCALE", "1", 1);
++    const bool scale2 = render_scale == 2;
++    setenv("PSPRECOMP_GLES_SCALE", scale2 ? "2" : "1", 1);
+     setenv("PSPRECOMP_GLES_CLIP", "1", 1);
+     // LCS_FPS_CAP throttles changing GE LIST addresses, not finished frames.
+     // A game frame contains several lists; keep only the existing vblank
+     // real-time pacing instead of sleeping 16.67 ms per list as well.
+     setenv("LCS_FPS_CAP", "0", 1);
+     unsetenv("LCS_UNCAPPED");
+-    setenv("PSPRECOMP_INTERNAL_WIDTH", "480", 1);
+-    setenv("PSPRECOMP_INTERNAL_HEIGHT", "272", 1);
++    setenv("PSPRECOMP_INTERNAL_WIDTH", scale2 ? "960" : "480", 1);
++    setenv("PSPRECOMP_INTERNAL_HEIGHT", scale2 ? "544" : "272", 1);
+     setenv("PSPRECOMP_AUDIO", "1", 1);
+ 
+     // ATRAC3/ATRAC3+ streams now use FFmpeg. Keep the separate PMF movie path
+diff --git a/android/app/src/main/java/com/ylports/lcsrecomp/MainActivity.java b/android/app/src/main/java/com/ylports/lcsrecomp/MainActivity.java
+index 6136310..61823cb 100644
+--- a/android/app/src/main/java/com/ylports/lcsrecomp/MainActivity.java
++++ b/android/app/src/main/java/com/ylports/lcsrecomp/MainActivity.java
+@@ -47,7 +47,7 @@ public final class MainActivity extends Activity {
+         System.loadLibrary("lcsrecomp");
+     }
+ 
+-    static native int nativeRun(String gameRoot, String configPath);
++    static native int nativeRun(String gameRoot, String configPath, int renderScale);
+     static native void nativeSetSurface(android.view.Surface surface);
+     static native void nativeSetDisplaySize(int width, int height);
+     static native void nativeSetInput(int buttons, int analogX, int analogY,
+@@ -146,6 +146,21 @@ public final class MainActivity extends Activity {
+         infoParams.topMargin = 18;
+         root.addView(info, infoParams);
+ 
++        Button scaleButton = new Button(this);
++        scaleButton.setText("Resolución interna: " + renderScale() + "× (tocar para cambiar)");
++        scaleButton.setOnClickListener(v -> {
++            int scale = renderScale() == 1 ? 2 : 1;
++            getSharedPreferences("graphics", MODE_PRIVATE).edit().putInt("render_scale", scale).apply();
++            scaleButton.setText("Resolución interna: " + scale + "× (tocar para cambiar)");
++        });
++        root.addView(scaleButton);
++        TextView scaleInfo = new TextView(this);
++        scaleInfo.setText("2× dibuja 4 veces más píxeles. 1× prioriza velocidad. Se aplica al iniciar.");
++        scaleInfo.setTextColor(Color.LTGRAY);
++        scaleInfo.setTextSize(12f);
++        scaleInfo.setGravity(Gravity.CENTER);
++        root.addView(scaleInfo);
++
+         statusView = new TextView(this);
+         String defaultStatus;
+         if (hasGameFiles()) {
+@@ -215,7 +230,10 @@ public final class MainActivity extends Activity {
+         buttons.addView(playButton, playParams);
+ 
+         root.addView(buttons, buttonsParams);
+-        setContentView(root);
++        android.widget.ScrollView launcherScroll = new android.widget.ScrollView(this);
++        launcherScroll.setFillViewport(true);
++        launcherScroll.addView(root);
++        setContentView(launcherScroll);
+     }
+ 
+     private String loadPreviousCrashReport() {
+@@ -668,6 +686,11 @@ public final class MainActivity extends Activity {
+                     + "; el recompilado requiere exactamente v1.05.");
+     }
+ 
++    private int renderScale() {
++        int scale = getSharedPreferences("graphics", MODE_PRIVATE).getInt("render_scale", 2);
++        return scale == 2 ? 2 : 1;
++    }
++
+     private File ensureConfig() throws IOException {
+         File config = new File(getFilesDir(), "LCSNative.ini");
+ 
+@@ -684,7 +707,7 @@ public final class MainActivity extends Activity {
+                 + "ShowFPS=false\n\n"
+                 + "[Rendering]\n"
+                 + "InternalResolutionMode=Scale\n"
+-                + "InternalScale=1\n"
++                + "InternalScale=" + renderScale() + "\n"
+                 + "MSAA=1\n"
+                 + "HardwareTransform=false\n\n"
+                 + "[Audio]\n"
+@@ -776,7 +799,7 @@ public final class MainActivity extends Activity {
+         final String configPath = config.getAbsolutePath();
+ 
+         gameThread = new Thread(null, () -> {
+-            int result = nativeRun(gameRoot, configPath);
++            int result = nativeRun(gameRoot, configPath, renderScale());
+             synchronized (MainActivity.this) {
+                 gameThread = null;
+             }
+diff --git a/android/tests/ge_command_state_regression.cpp b/android/tests/ge_command_state_regression.cpp
+new file mode 100644
+index 0000000..037caef
+--- /dev/null
++++ b/android/tests/ge_command_state_regression.cpp
+@@ -0,0 +1,81 @@
++// Exercise the real GE command executor and real vertex/texture readers.
++// Only primitive submission and flush are replaced, to inspect the latched state.
++#include "../../lcs/host/ge_renderer.cpp"
++#include "../../lcs/host/lcs_ge_exec.hpp"
++#include <iostream>
++#include <cassert>
++#include <vector>
++namespace psprecomp {
++std::int32_t runtime_thread_uid() noexcept {return 0;}
++const char *runtime_thread_name() noexcept {return "test";}
++std::uint32_t runtime_dispatch_pc() noexcept {return 0;}
++}
++namespace lcs {
++static GeTransformState captured;
++static std::array<std::uint32_t,256> captured_commands;
++bool test_capture_primitive(psprecomp::GuestMemory &,const std::array<std::uint32_t,256> &cmd,
++ const GeTransformState &tr,std::uint32_t va,std::uint32_t ia,std::uint32_t,
++ GeRenderStats &stats,std::string &,std::uint32_t,std::uint64_t,std::uint64_t,std::uint64_t,bool) {
++ captured=tr;captured_commands=cmd;stats.next_vertex_address=va;stats.next_index_address=ia;return true;
++}
++void test_flush(psprecomp::GuestMemory &) {}
++}
++using namespace lcs;
++static std::uint32_t f24(float f) {return std::bit_cast<std::uint32_t>(f)>>8;}
++static bool equal(Color a, Color b) {return a.r==b.r && a.g==b.g && a.b==b.b && a.a==b.a;}
++int main(int argc,char**argv) {
++ psprecomp::GuestMemory memory;
++ constexpr std::uint32_t code=0x08001000u,palette=0x08010000u,texture=0x08012000u;
++ auto run=[&](const std::vector<std::uint32_t> &words) {
++   for (std::size_t i=0;i<words.size();i++) memory.store32(code+static_cast<std::uint32_t>(i)*4u,words[i]);
++   memory.store32(code+static_cast<std::uint32_t>(words.size())*4u,0x04030003u);
++   memory.store32(code+static_cast<std::uint32_t>(words.size()+1)*4u,0x0c000000u);
++   execute_ge_list_rendered(memory,code);
++ };
++ const std::array<float,12> matrix{2,0,0,0,3,0,0,0,1,0.25f,0.5f,1};
++ std::vector<std::uint32_t> words{0x40000000u};
++ for (float f:matrix)words.push_back(0x41000000u|f24(f));
++ run(words);
++ if (!(argc>1 && std::string(argv[1])=="palette")) {
++   if (captured.texture!=matrix) {std::cout<<"FAIL: GE texture matrix commands were discarded\n";return 1;}
++   auto point=transform_4x3(captured.texture,{0.5f,0.25f,0});
++   assert(point.x==1.25f && point.y==1.25f && point.z==1.0f);
++   std::cout<<"PASS: real GE list executes TEXMTXNUM/TEXMTXDATA, including repeated zeros\n";
++ }
++ for (unsigned i=0;i<256;i++)memory.store32(palette+i*4u,0xff0000ffu); // Red
++ run({0xb0000000u|(palette&0x00ffffffu),0xb1000000u|((palette>>8)&0xf0000u),0xc4000020u});
++ const auto first_snapshot=captured.clut.snapshot;
++ const auto checksum=captured.clut.checksum;
++ if (!first_snapshot || (*first_snapshot)[0]!=255 || (*first_snapshot)[1]!=0) {
++   std::cout<<"FAIL: CLUTLOAD did not retain palette bytes\n";return 1;
++ }
++ auto cmd=captured_commands;
++ cmd[0xc3]=5;cmd[0xc5]=3u|(255u<<8);cmd[0xa0]=texture&0x00ffffffu;cmd[0xa8]=1|((texture>>8)&0xf0000u);cmd[0xb8]=0;
++ memory.store8(texture,1);
++ auto before=make_texture_setup_for_level(memory,cmd,0,&captured.clut);
++ assert(equal(sample_texture_nearest(memory,before,0,0),{255,0,0,255}));
++ for (unsigned i=0;i<256;i++)memory.store32(palette+i*4u,0xff00ff00u); // RAM now green
++ run({});
++ assert(captured.clut.snapshot==first_snapshot && captured.clut.checksum==checksum);
++ auto unchanged=make_texture_setup_for_level(memory,cmd,0,&captured.clut);
++ assert(equal(sample_texture_nearest(memory,unchanged,0,0),{255,0,0,255}));
++ run({0xc4000001u}); // Partial 32-byte update, upper palette entries stay red
++ auto after=make_texture_setup_for_level(memory,cmd,0,&captured.clut);
++ assert(equal(sample_texture_nearest(memory,after,0,0),{0,255,0,255}));
++ assert(equal(read_clut_fast(memory,after,20),{255,0,0,255}));
++ assert(equal(sample_texture_nearest(memory,before,0,0),{255,0,0,255})); // queued old snapshot
++ auto last=captured.clut.snapshot;run({0xc4000000u});assert(captured.clut.snapshot==last);
++ // All four indexed formats read the same palette with mask/shift/start.
++ for (unsigned fmt=4;fmt<=7;fmt++) {
++   cmd[0xc3]=fmt;memory.store32(texture,1);
++   const auto t=make_texture_setup_for_level(memory,cmd,0,&captured.clut);
++   assert(equal(sample_texture_nearest(memory,t,0,0),{0,255,0,255}));
++ }
++ // 16-bit CLUT can access upper 256 entries too.
++ for (unsigned i=0;i<512;i++)memory.store16(palette+2*i,0xffffu);
++ memory.store16(palette+2*511,0x801fu);
++ run({0xc4000020u});cmd[0xc5]=1u|(15u<<8)|(31u<<16);cmd[0xc3]=5;
++ memory.store8(texture,15);auto last16=make_texture_setup_for_level(memory,cmd,0,&captured.clut);
++ assert(equal(sample_texture_nearest(memory,last16,0,0),{255,0,0,255}));
++ std::cout<<"PASS: real CLUTLOAD retains bytes across RAM writes; partial/zero loads, queued snapshots, T4/T8/T16/T32, 16-bit entry 511\n";
++}
+diff --git a/android/tests/gles_backend_integration.cpp b/android/tests/gles_backend_integration.cpp
+index 1227c54..085e680 100644
+--- a/android/tests/gles_backend_integration.cpp
++++ b/android/tests/gles_backend_integration.cpp
+@@ -133,6 +133,65 @@ int main(){
+     std::cout<<"PASS: actual flat shading, winding and depth clipping; no GL errors\n";
+ 
+ 
++    // Compare explicit indices and adjacent merging against native GL lists,
++    // strips and fans (the previous path), not against a second use of the new converter.
++    unsigned merged_images=0;
++    for (unsigned primitive=3;primitive<=5;++primitive)
++    for (unsigned test=0;test<40;++test) {
++        auto d=color;d.primitive=primitive;
++        auto viewport=vp;viewport.flat_shading=(test&1)!=0;
++        viewport.cull_enabled=(test%3)!=0;
++        viewport.accept_counter_clockwise=(test%3)==2;
++        d.blend_enabled=(test%4)==0;d.blend_equation=0;
++        d.blend_source_factor=2;d.blend_dest_factor=3;
++        std::array<GeGpuVertex,6> a{},b{};
++        for(unsigned n=0;n<a.size();++n) {
++            a[n].x=-.95f+float(n%2)*.9f+float(test%5)*.03f;
++            a[n].y=-.9f+float(n/2)*.6f;
++            a[n].w=1.0f;a[n].z=.2f;
++            a[n].rgba=0x800000ffu+(n*35u<<8)+(n*19u<<16);
++            b[n]=a[n];b[n].x+=.9f;b[n].y-=.15f;b[n].rgba^=0x00ffffffu;
++        }
++        clear_target();
++        for (const auto *verts:{&a,&b}) {
++            GlesBatch raw{};raw.draw=d;raw.clip_coordinates=true;raw.clip_viewport=viewport;
++            raw.vertices.assign(verts->begin(),verts->end());s.batches.push_back(std::move(raw));
++        }
++        assert(ge_gpu_backend_finish_color_frame(400+test));auto reference=read_all();
++        clear_target();
++        assert(ge_gpu_backend_accumulate_clip_vertices(d,viewport,a));
++        assert(ge_gpu_backend_accumulate_clip_vertices(d,viewport,b));
++        assert(s.batches.size()==1 && !s.batches[0].indices.empty());
++        assert(ge_gpu_backend_finish_color_frame(450+test));auto actual=read_all();
++        assert(reference==actual);++merged_images;
++    }
++    std::cout<<"PASS: "<<merged_images<<" actual merged list/strip/fan images equal native GL primitive reference, flat colour, winding, blend overlap and boundaries\n";
++
++    // A 2x target must really allocate four times as many pixels, while logical
++    // coordinates/UV and uploaded texture contents remain unchanged.
++    s.scale=2;
++    auto doubled=color;
++    auto left=quad(0,0,8,16),right=quad(8,0,16,16);
++    for(auto &v:left)v.rgba=0xff0000ff;
++    for(auto &v:right)v.rgba=0xffff0000;
++    ge_gpu_backend_accumulate_color_triangles(doubled,left);
++    ge_gpu_backend_accumulate_color_triangles(doubled,right);
++    assert(ge_gpu_backend_finish_color_frame(490));
++    const auto &rt=s.targets.at(0x10000u);
++    assert(rt.render_width==32 && rt.render_height==32);
++    assert((pixel(7,16)==std::array<unsigned char,4>{255,0,0,255}));
++    assert((pixel(24,16)==std::array<unsigned char,4>{0,0,255,255}));
++    // Flip back without retaining a stale size/sampler or invalid FBO.
++    s.scale=1;
++    ge_gpu_backend_accumulate_color_triangles(doubled,left);
++    ge_gpu_backend_accumulate_color_triangles(doubled,right);
++    assert(ge_gpu_backend_finish_color_frame(491));
++    assert(rt.render_width==16 && rt.render_height==16);
++    assert((pixel(3,8)==std::array<unsigned char,4>{255,0,0,255}));
++    assert((pixel(12,8)==std::array<unsigned char,4>{0,0,255,255}));
++    assert(glGetError()==GL_NO_ERROR);
++    std::cout<<"PASS: actual 1x -> 2x -> 1x FBO sizes and identical logical scene; no GL errors\n";
++
+     // The old backend silently disabled every unrecognized blend pair. Compare
+     // every supported PSP factor/equation against the ACTUAL software blender.
+     unsigned blend_cases=0;
+diff --git a/android/tests/scale_config_regression.py b/android/tests/scale_config_regression.py
+new file mode 100644
+index 0000000..57355fc
+--- /dev/null
++++ b/android/tests/scale_config_regression.py
+@@ -0,0 +1,18 @@
++#!/usr/bin/env python3
++"""Wiring contract test; actual FBO sizes are tested separately in GLES."""
++from pathlib import Path
++import re
++root=Path(__file__).resolve().parents[2]
++java=(root/'android/app/src/main/java/com/ylports/lcsrecomp/MainActivity.java').read_text()
++bridge=(root/'android/app/src/main/cpp/android_bridge.cpp').read_text()
++assert 'native int nativeRun(String gameRoot, String configPath, int renderScale)' in java
++assert 'nativeRun(gameRoot, configPath, renderScale())' in java
++assert '"InternalScale=" + renderScale()' in java
++assert 'getInt("render_scale", 2)' in java
++assert 'putInt("render_scale", scale)' in java
++assert 'jint render_scale)' in bridge
++assert 'const bool scale2 = render_scale == 2;' in bridge
++assert 'setenv("PSPRECOMP_GLES_SCALE", scale2 ? "2" : "1", 1);' in bridge
++assert 'versionName "0.6.12"' in (root/'android/app/build.gradle').read_text()
++assert 'LCS Android 0.6.12' in (root/'lcs/host/lcs_android_build.cpp').read_text()
++print('PASS: persisted 1x/2x launcher -> JNI -> internal scale config; default 2x; native version 0.6.12')
+diff --git a/android/tests/verify_apk.py b/android/tests/verify_apk.py
+index 736a3d0..938c249 100644
+--- a/android/tests/verify_apk.py
++++ b/android/tests/verify_apk.py
+@@ -4,7 +4,7 @@ from pathlib import Path
+ import hashlib, subprocess, sys, zipfile
+ apk=Path(sys.argv[1])
+ sha=subprocess.check_output(['git','rev-parse','--short=12','HEAD'],text=True).strip()
+-expected=('LCS Android 0.6.11 source='+sha).encode()
++expected=('LCS Android 0.6.12 source='+sha).encode()
+ with zipfile.ZipFile(apk) as z:
+     name='lib/arm64-v8a/liblcsrecomp.so'; data=z.read(name)
+     assert data[:5]==b'\x7fELF\x02' and int.from_bytes(data[18:20],'little')==183
+diff --git a/android/tests/vertex_memo_regression.cpp b/android/tests/vertex_memo_regression.cpp
+new file mode 100644
+index 0000000..5a05f8b
+--- /dev/null
++++ b/android/tests/vertex_memo_regression.cpp
+@@ -0,0 +1,94 @@
++// Tests the real vertex decoder with exact per-primitive record reuse.
++#include "../../lcs/host/ge_renderer.cpp"
++#include "../../lcs/host/lcs_ge_triangle_indices.hpp"
++#include <cassert>
++#include <chrono>
++#include <iostream>
++#include <random>
++namespace psprecomp {
++std::int32_t runtime_thread_uid() noexcept{return 0;}
++const char *runtime_thread_name() noexcept{return "test";}
++std::uint32_t runtime_dispatch_pc() noexcept{return 0;}
++}
++using namespace lcs;
++static void same(const Vertex&a,const Vertex&b) {
++    assert(std::bit_cast<std::uint32_t>(a.color)==std::bit_cast<std::uint32_t>(b.color));
++    const float av[]{a.u,a.v,a.q,a.x,a.y,a.z,a.w,a.inv_w,a.fog_factor};
++    const float bv[]{b.u,b.v,b.q,b.x,b.y,b.z,b.w,b.inv_w,b.fog_factor};
++    for(unsigned i=0;i<std::size(av);++i) assert(std::bit_cast<std::uint32_t>(av[i])==std::bit_cast<std::uint32_t>(bv[i]));
++}
++int main() {
++    psprecomp::GuestMemory mem; std::array<std::uint32_t,256> cmd{};
++    GeTransformState tr{};reset_ge_transform_state(tr);
++    VertexLayout layout{};std::string error; assert(build_vertex_layout_cached(0x1ffu,layout,error));
++    assert(layout.stride<=64);
++    cmd[0x17]=1;cmd[0x18]=1;cmd[0x65]=std::bit_cast<std::uint32_t>(1.f)>>8;
++    cmd[0x58]=255;cmd[0x55]=0x778899;cmd[0x56]=0xffffff;cmd[0x5c]=0x303030;cmd[0x5d]=255;cmd[0x90]=0x8090a0;
++    std::mt19937 rng(612);std::uniform_real_distribution<float> unit(-1,1);
++    constexpr std::uint32_t address=0x08001000;
++    constexpr unsigned records=32;
++    for(unsigned i=0;i<records;i++) {
++        const auto at=address+i*layout.stride;mem.store32(at+layout.color_offset,rng());
++        for(unsigned j=0;j<3;j++) {
++            mem.store32(at+layout.position_offset+4*j,std::bit_cast<std::uint32_t>(unit(rng)));
++            mem.store32(at+layout.normal_offset+4*j,std::bit_cast<std::uint32_t>(unit(rng)));
++        }
++        mem.store32(at+layout.tc_offset,std::bit_cast<std::uint32_t>(unit(rng)));
++        mem.store32(at+layout.tc_offset+4,std::bit_cast<std::uint32_t>(unit(rng)));
++    }
++    GeVertexMemo<Vertex> memo;unsigned hits=0,cases=0;
++    for(unsigned primitive=0;primitive<60;primitive++) {
++        cmd[0x55]=rng()&0xffffff;cmd[0x5f]=primitive%3;
++        auto light=prepare_lighting(true,cmd);memo.begin();
++        for(unsigned n=0;n<1024;n++) {
++            const auto at=address+(n%records)*layout.stride;
++            if(n%127==0)mem.store32(at+layout.color_offset,rng());
++            Vertex reference{},actual{};bool hit=false;
++            assert(decode_vertex_optimized(mem,at,layout,cmd,tr,reference,error,&light));
++            assert(memo.decode(mem.raw_pointer(at,layout.stride),layout.stride,actual,hit,[&](Vertex&out){
++                return decode_vertex_optimized(mem,at,layout,cmd,tr,out,error,&light);
++            }));
++            same(reference,actual);hits+=hit;cases++;
++        }
++    }
++    assert(hits>20000);
++    std::cout<<"PASS: "<<cases<<" exact full-vertex record reuse comparisons; changed records and primitive/material boundaries; hits="<<hits<<"\n";
++    // Collision safety and malformed records: only successful decodes are stored.
++    Vertex out{};bool hit=false;unsigned attempts=0;memo.begin();
++    const auto *p=mem.raw_pointer(address,layout.stride);
++    for(unsigned n=0;n<2;n++)assert(!memo.decode(p,layout.stride,out,hit,[&](Vertex&){++attempts;return false;}));
++    assert(attempts==2 && !hit);
++    assert(memo.decode(nullptr,0,out,hit,[&](Vertex&){return true;}) && !hit);
++    std::vector<std::uint32_t> list;
++    for(unsigned primitive=3;primitive<=5;primitive++)for(unsigned count=0;count<100;count++) {
++        list.clear();append_ge_triangle_indices(list,primitive,count,17);
++        const auto triangles=count<3?0:primitive==3?count/3:count-2;
++        assert(list.size()==triangles*3);
++        for(unsigned t=0;t<triangles;t++) {
++            const auto *x=list.data()+t*3;
++            assert(x[0]>=17 && x[1]>=17 && x[2]<17+count);
++            if(primitive==3)assert(x[0]==17+t*3 && x[1]==18+t*3 && x[2]==19+t*3);
++            if(primitive==4)assert(x[0]==17+t+(t&1) && x[1]==18+t-(t&1) && x[2]==19+t);
++            if(primitive==5)assert(x[0]==17 && x[1]==18+t && x[2]==19+t);
++        }
++    }
++    list.clear();append_ge_triangle_indices(list,4,4,0);append_ge_triangle_indices(list,4,4,4);
++    assert((list==std::vector<std::uint32_t>{0,1,2,2,1,3,4,5,6,6,5,7}));
++    std::cout<<"PASS: 300 triangle list/strip/fan conversions preserve winding, provoking vertices and independent boundaries\n";
++    // Informational microbenchmark: cache is enabled only for expensive records.
++    const auto light=prepare_lighting(true,cmd);
++    constexpr unsigned loops=200000;
++    auto run=[&](bool cached){
++        memo.begin();std::uint64_t checksum=0;auto begin=std::chrono::steady_clock::now();
++        for(unsigned i=0;i<loops;i++) {
++            const auto at=address+(i%records)*layout.stride;Vertex v{};bool h;
++            auto decode=[&](Vertex&x){return decode_vertex_optimized(mem,at,layout,cmd,tr,x,error,&light);};
++            if(cached) assert(memo.decode(mem.raw_pointer(at,layout.stride),layout.stride,v,h,decode));
++            else assert(decode(v));
++            checksum+=std::bit_cast<std::uint32_t>(v.color);
++        }
++        return std::pair{std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count(),checksum};
++    };
++    auto reference=run(false),cached=run(true);assert(reference.second==cached.second);
++    std::cout<<"HOST ONLY: repeated records referenceMs="<<reference.first<<" memoMs="<<cached.first<<"; NOT Android or game FPS\n";
++}
+diff --git a/lcs/host/ge_gpu_backend_gles.cpp b/lcs/host/ge_gpu_backend_gles.cpp
+index 3b8c080..5608881 100644
+--- a/lcs/host/ge_gpu_backend_gles.cpp
++++ b/lcs/host/ge_gpu_backend_gles.cpp
+@@ -1,4 +1,5 @@
+ #include "ge_gpu_backend.hpp"
++#include "lcs_ge_triangle_indices.hpp"
+ 
+ #if defined(__ANDROID__)
+ 
+@@ -83,6 +84,7 @@ struct GlesState {
+     std::thread::id gl_thread{};
+     std::uint32_t scale{2u};
+     std::uint64_t frame_epoch{1u};
++    std::uint64_t merged_clip_batches{};
+     std::uint64_t validation_epoch{1u};
+     std::unordered_map<std::uint32_t, GLuint> samplers;
+     std::array<std::uint32_t,16> pixel_uniform_key{};
+@@ -1950,36 +1952,54 @@ bool gles_draw_state_compatible(
+ 
+ 
+ bool ge_gpu_backend_accumulate_clip_vertices(const GeGpuDrawDescriptor &input_draw,
+-    const GeGpuClipViewport &viewport,std::span<const GeGpuVertex> vertices) noexcept {
++    const GeGpuClipViewport &viewport, std::span<const GeGpuVertex> vertices) noexcept {
+     auto &s=state();
+     const char *setting=std::getenv("PSPRECOMP_GLES_CLIP");
+     if (!s.enabled || (setting && std::strcmp(setting,"0")==0) || vertices.empty()) return false;
+-    const auto draw=snapshot_texture_draw(input_draw);
+-    if (draw.primitive<3u || draw.primitive>5u || draw.through || draw.clear_mode) return false;
++    auto draw=snapshot_texture_draw(input_draw);
++    const auto primitive=draw.primitive;
++    if (primitive<3u || primitive>5u || draw.through || draw.clear_mode) return false;
++    if (vertices.size()>1048576u) return false;
+     if (viewport.requires_inside_depth) {
+         for (const auto &v : vertices)
+             if (!std::isfinite(v.x+v.y+v.z+v.w) || !(v.w>0) || v.z < -v.w || v.z > v.w)
+-                return false; // No draw consumed; CPU route retains PSP depth behaviour.
++                return false;
++    }
++    if (vertices.size()<3u) return true;
++    // All model transforms are already applied. Shared viewport/material draws
++    // can therefore be merged without regrouping objects or changing draw order.
++    // Explicit triangle indices preserve boundaries, strip winding and flat colour.
++    draw.primitive=3u;
++    GlesBatch fresh{};
++    GlesBatch *destination=&fresh;
++    const char *merge=std::getenv("PSPRECOMP_GLES_MERGE_CLIP");
++    if (!(merge && std::strcmp(merge,"0")==0) && !s.batches.empty()) {
++        auto &last=s.batches.back();
++        if (last.clip_coordinates && last.draw.primitive==3u && !last.indices.empty() &&
++            last.clip_viewport==viewport && gles_draw_state_compatible(last.draw,draw) &&
++            last.vertices.size()+vertices.size()<=1048576u) destination=&last;
+     }
+     try {
+-        GlesBatch batch{};
+-        batch.draw=draw;batch.clip_coordinates=true;batch.clip_viewport=viewport;
+-        batch.vertices.assign(vertices.begin(),vertices.end());
+-        if (draw.texture_enabled && draw.texture_width && draw.texture_height) {
+-            const float iw=1.0f/draw.texture_width,ih=1.0f/draw.texture_height;
+-            for (auto &v:batch.vertices) { v.u*=iw;v.v*=ih; }
+-        }
+-        // Merge independent triangle lists only. Strips/fans require explicit
+-        // boundaries; concatenation would invent bridging triangles.
+-        if (draw.primitive==3u && !s.batches.empty()) {
+-            auto &last=s.batches.back();
+-            if (last.clip_coordinates && last.draw.primitive==3u &&
+-                last.clip_viewport==viewport && gles_draw_state_compatible(last.draw,draw)) {
+-                last.vertices.insert(last.vertices.end(),batch.vertices.begin(),batch.vertices.end());
+-                return true;
+-            }
++        const std::uint32_t base=static_cast<std::uint32_t>(destination->vertices.size());
++        const auto count=static_cast<std::uint32_t>(vertices.size());
++        const std::size_t indices=primitive==3u ? (count/3u)*3u : (count-2u)*3u;
++        // Reserve both before modifying sizes, so allocation failure consumes no draw.
++        const auto reserve_growing=[](auto &buffer, std::size_t required) {
++            if (required>buffer.capacity()) buffer.reserve(std::max(required,buffer.capacity()*2u));
++        };
++        reserve_growing(destination->vertices,static_cast<std::size_t>(base)+count);
++        reserve_growing(destination->indices,destination->indices.size()+indices);
++        destination->vertices.insert(destination->vertices.end(),vertices.begin(),vertices.end());
++        const float iw=draw.texture_enabled && draw.texture_width ? 1.0f/draw.texture_width : 1.0f;
++        const float ih=draw.texture_enabled && draw.texture_height ? 1.0f/draw.texture_height : 1.0f;
++        for (std::size_t i=base;i<destination->vertices.size();++i) {
++            destination->vertices[i].u*=iw;destination->vertices[i].v*=ih;
+         }
+-        s.batches.push_back(std::move(batch));
++        append_ge_triangle_indices(destination->indices,primitive,count,base);
++        if (destination==&fresh) {
++            fresh.draw=draw;fresh.clip_coordinates=true;fresh.clip_viewport=viewport;
++            s.batches.push_back(std::move(fresh));
++        } else ++s.merged_clip_batches;
+         return true;
+     } catch (...) { return false; }
+ }
+@@ -2207,6 +2227,8 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
+             " colorTestDraws=" + std::to_string(s.perf_color_tests)+
+             " gpuClipDraws="+std::to_string(s.perf_clip_draws)+
+             " gpuClipVertices="+std::to_string(s.perf_clip_vertices)+
++            " mergedClip="+std::to_string(s.merged_clip_batches)+
++            " renderScale="+std::to_string(s.scale)+
+             " blendFetch="+std::to_string(s.framebuffer_fetch_enabled ? 1 : 0)+
+             " blendFallbacks="+std::to_string(s.perf_blend_fallbacks)+
+             " missingTextures="+std::to_string(s.perf_missing_textures)+
+@@ -2219,6 +2241,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
+         s.perf_blend_equations.fill(0);
+         s.perf_blend_fallbacks=s.perf_missing_textures=0;
+         s.perf_clip_draws=s.perf_clip_vertices=0;
++        s.merged_clip_batches=0;
+         s.perf_presents = s.perf_epochs = s.perf_color_tests = 0;
+         s.perf_window = perf_now;
+     }
+@@ -2247,6 +2270,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
+                          " cpuSubmitMs=" + std::to_string(average_ms) +
+                          " targets=" + std::to_string(s.targets.size()) +
+                          " textures=" + std::to_string(s.textures.size()) +
++                         " render=" + std::to_string(s.report.offscreen_width) + "x" + std::to_string(s.report.offscreen_height) +
+                          " cacheMB=" + std::to_string(
+                              s.texture_cache_bytes / (1024u * 1024u)) +
+                          " draws=" + std::to_string(s.report.game_draw_calls) +
+diff --git a/lcs/host/ge_renderer.cpp b/lcs/host/ge_renderer.cpp
+index 50e2cc3..3bce9f5 100644
+--- a/lcs/host/ge_renderer.cpp
++++ b/lcs/host/ge_renderer.cpp
+@@ -1,4 +1,5 @@
+ #include "ge_renderer.hpp"
++#include "lcs_ge_vertex_memo.hpp"
+ #include "ge_gpu_backend.hpp"
+ #include "lcs_controls.hpp"
+ #include "lcs_fps_overlay.hpp"
+@@ -147,6 +148,10 @@ std::uint64_t g_ge_triangle_prep_ns{};
+ std::uint64_t g_ge_gpu_accumulate_ns{};
+ std::uint64_t g_ge_primitive_count{};
+ std::uint64_t g_ge_vertex_count{};
++std::uint64_t g_ge_memo_hits{};
++std::uint64_t g_ge_clut_loads{};
++std::uint64_t g_ge_texture_matrix_words{};
++std::uint64_t g_ge_palette_draws{};
+ 
+ struct PhaseTimer {
+     std::uint64_t *sink;
+@@ -455,6 +460,29 @@ void reset_ge_transform_state(GeTransformState &state) noexcept {
+     state.morph_weights[0] = 1.0f;
+ }
+ 
++void load_ge_clut(GeClutState &state, const psprecomp::GuestMemory &memory,
++                  std::uint32_t address, std::uint32_t blocks) {
++    const std::size_t count = std::min<std::size_t>((blocks & 63u) * 32u, 1024u);
++    if (count == 0u) return;
++    ++state.loads;
++    ++g_ge_clut_loads;
++    auto next = std::make_shared<GeClutState::Bytes>(state.data());
++    if (const auto *source = memory.raw_pointer(address, count))
++        std::memcpy(next->data(), source, count);
++    else {
++        for (std::size_t i = 0; i < count; ++i) {
++            const auto a = static_cast<std::uint64_t>(address) + i;
++            (*next)[i] = a <= 0xFFFFFFFFull && memory.contains(static_cast<std::uint32_t>(a), 1)
++                ? memory.load8(static_cast<std::uint32_t>(a)) : 0;
++        }
++    }
++    if (state.snapshot && *next == *state.snapshot) return;
++    std::uint32_t checksum = 2166136261u;
++    for (auto b : *next) { checksum ^= b; checksum *= 16777619u; }
++    state.checksum = checksum;
++    state.snapshot = std::move(next);
++}
++
+ void update_ge_transform_state(GeTransformState &state, std::uint32_t command,
+                                std::uint32_t data) noexcept {
+     switch (command) {
+@@ -502,6 +530,7 @@ void update_ge_transform_state(GeTransformState &state, std::uint32_t command,
+         state.texture_cursor = data & 0xFu;
+         break;
+     case 0x41u: {
++        ++g_ge_texture_matrix_words;
+         const std::uint32_t index = state.texture_cursor & 0xFu;
+         if (index < state.texture.size()) state.texture[index] = decode_float24(data);
+         state.texture_cursor = (index + 1u) & 0xFu;
+@@ -1858,6 +1887,7 @@ Color read_clut(const psprecomp::GuestMemory &memory, const std::array<std::uint
+ }
+ 
+ struct TextureSetup {
++    std::shared_ptr<const GeClutState::Bytes> clut_snapshot;
+     const std::uint8_t *pixels{};
+     const std::uint8_t *clut_pixels{};
+     std::uint32_t base{};
+@@ -1879,7 +1909,7 @@ struct TextureSetup {
+     std::uint32_t selected_level{};
+ };
+ 
+-TextureSetup make_texture_setup_for_level(const psprecomp::GuestMemory &memory, const std::array<std::uint32_t, 256> &commands, std::uint32_t requested_level) noexcept {
++TextureSetup make_texture_setup_for_level(const psprecomp::GuestMemory &memory, const std::array<std::uint32_t, 256> &commands, std::uint32_t requested_level, const GeClutState *palette = nullptr) noexcept {
+     TextureSetup setup{}; setup.selected_level=std::min<std::uint32_t>(requested_level,7u);
+     const std::uint32_t size = data24(commands[0xB8u + setup.selected_level]);
+     setup.width = 1u << (size & 0xFu);
+@@ -1906,8 +1936,14 @@ TextureSetup make_texture_setup_for_level(const psprecomp::GuestMemory &memory,
+     const std::uint32_t row_bytes = setup.buffer_width * 4u;
+     const std::uint64_t span = static_cast<std::uint64_t>(setup.height + 8u) * (row_bytes + 128u);
+     setup.pixels = memory.raw_pointer(setup.base, static_cast<std::size_t>(span));
+-    setup.clut_pixels = memory.raw_pointer(setup.clut_base,
++    if (palette != nullptr) {
++        // Read the internal palette, not whatever RAM happens to contain now.
++        setup.clut_snapshot = palette->snapshot;
++        setup.clut_pixels = palette->data().data();
++    } else {
++        setup.clut_pixels = memory.raw_pointer(setup.clut_base,
+                                            (setup.clut_wrap_mask + 1u) * setup.clut_entry_bytes);
++    }
+     return setup;
+ }
+ 
+@@ -4121,33 +4157,9 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+         gpu_draw.vertex_count = count;
+ 
+         gpu_draw.clut_checksum = 0u;
+-        if (gpu_draw.texture_format >= 4u && gpu_draw.texture_format <= 7u &&
+-            gpu_draw.clut_address != 0u) {
+-            const std::uint32_t entry_bytes = gpu_draw.clut_format == 3u ? 4u : 2u;
+-            const std::uint32_t first = std::min(gpu_draw.clut_start, 255u);
+-            const std::uint32_t last = std::min(first + gpu_draw.clut_mask, 255u);
+-            const std::uint32_t offset_bytes = first * entry_bytes;
+-            const std::uint32_t clut_bytes = (last - first + 1u) * entry_bytes;
+-            if (const std::uint8_t *clut = memory.raw_pointer(
+-                    gpu_draw.clut_address + offset_bytes, clut_bytes)) {
+-                std::uint32_t checksum = 2166136261u;
+-                std::uint32_t offset = 0u;
+-                for (; offset + 4u <= clut_bytes; offset += 4u) {
+-                    const std::uint32_t word = static_cast<std::uint32_t>(clut[offset]) |
+-                        (static_cast<std::uint32_t>(clut[offset + 1u]) << 8u) |
+-                        (static_cast<std::uint32_t>(clut[offset + 2u]) << 16u) |
+-                        (static_cast<std::uint32_t>(clut[offset + 3u]) << 24u);
+-                    checksum ^= word;
+-                    checksum *= 16777619u;
+-                }
+-                if (offset < clut_bytes) {
+-                    std::uint32_t tail = clut[offset];
+-                    if (offset + 1u < clut_bytes) tail |= static_cast<std::uint32_t>(clut[offset + 1u]) << 8u;
+-                    checksum ^= tail;
+-                    checksum *= 16777619u;
+-                }
+-                gpu_draw.clut_checksum = checksum;
+-            }
++        if (gpu_draw.texture_enabled && gpu_draw.texture_format >= 4u && gpu_draw.texture_format <= 7u) {
++            gpu_draw.clut_checksum = transform.clut.checksum;
++            ++g_ge_palette_draws;
+         }
+         ge_gpu_backend_prepare_texture_keys(gpu_draw);
+         gpu_draw.texture_content_signature = 0u;
+@@ -4159,7 +4171,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+             std::uint64_t signature = 0xCBF29CE484222325ull;
+             bool any_signature = false;
+             for (std::uint32_t level = 0u; level < signature_levels; ++level) {
+-                const TextureSetup source = make_texture_setup_for_level(memory, commands, level);
++                const TextureSetup source = make_texture_setup_for_level(memory, commands, level, &transform.clut);
+                 const std::uint64_t part = texture_source_signature(memory, source);
+                 if (part == 0u) continue;
+                 any_signature = true;
+@@ -4225,7 +4237,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+         std::size_t total_bytes = 0u;
+         bool all = true;
+         for (std::uint32_t level = 0u; level < level_count; ++level) {
+-            mip_setups[level] = make_texture_setup_for_level(memory, commands, level);
++            mip_setups[level] = make_texture_setup_for_level(memory, commands, level, &transform.clut);
+             const std::uint64_t bytes = static_cast<std::uint64_t>(mip_setups[level].width) *
+                                         mip_setups[level].height * 4ull;
+             if (bytes > std::numeric_limits<std::size_t>::max() - total_bytes) {
+@@ -4659,6 +4671,8 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+     {
+         PhaseTimer bind_timer(g_ge_draw_setup_ns);
+         bind_fragment_buffers(setup, memory, commands);
++        setup.texture = make_texture_setup_for_level(memory, commands,
++            selected_texture_level(commands), &transform.clut);
+     }
+ 
+     static thread_local std::vector<Vertex> vertices;
+@@ -4676,6 +4690,11 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+         const PreparedLighting primitive_lighting = prepare_lighting(layout.color_type >= 4u, commands);
+         static thread_local VertexLightingCache primitive_light_cache;
+         primitive_light_cache.begin(primitive_lighting);
++        static thread_local GeVertexMemo<Vertex> primitive_vertex_cache;
++        primitive_vertex_cache.begin();
++        const bool memo_enabled = gpu_backend_enabled && layout.index_type==0u &&
++            !layout.through && count>=12u && layout.stride<=64u &&
++            (primitive_lighting.enabled || layout.weight_type!=0u || layout.morph_count>1u);
+ #if defined(__ANDROID__)
+         const float primitive_x_scale = layout.through ? 1.0f : android_ultrawide_x_scale();
+ #endif
+@@ -4697,8 +4716,15 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+                 static_cast<std::uint32_t>(source_address), layout.stride);
+             if (record == nullptr) { error = "GE vertex record outside guest memory"; return false; }
+             const VertexByteView record_view{record, layout.stride};
+-            if (!decode_vertex_optimized(record_view, 0u, layout,
+-                                         commands, transform, vertex, error, &primitive_lighting, &primitive_light_cache)) return false;
++            const auto decode = [&](Vertex &out) {
++                return decode_vertex_optimized(record_view, 0u, layout,
++                    commands, transform, out, error, &primitive_lighting, &primitive_light_cache);
++            };
++            bool memo_hit=false;
++            if (memo_enabled) {
++                if (!primitive_vertex_cache.decode(record,layout.stride,vertex,memo_hit,decode)) return false;
++                if (memo_hit) ++g_ge_memo_hits;
++            } else if (!decode(vertex)) return false;
+ #if defined(__ANDROID__)
+             // SurfaceFlinger stretches the low-resolution producer buffer to the
+             // physical ultrawide display. Compress 3D clip X by the inverse
+@@ -4958,6 +4984,7 @@ GePhaseTotals ge_phase_totals() noexcept {
+         g_ge_draw_setup_ns, g_ge_texture_upload_ns, g_ge_vertex_decode_ns,
+         g_ge_gpu_stage_ns, g_ge_triangle_prep_ns, g_ge_gpu_accumulate_ns,
+         g_ge_primitive_count, g_ge_vertex_count,
++        g_ge_memo_hits, g_ge_clut_loads, g_ge_texture_matrix_words, g_ge_palette_draws,
+     };
+ }
+ 
+@@ -4972,6 +4999,7 @@ void reset_ge_phase_totals() noexcept {
+     g_ge_gpu_accumulate_ns = 0u;
+     g_ge_primitive_count = 0u;
+     g_ge_vertex_count = 0u;
++    g_ge_memo_hits=g_ge_clut_loads=g_ge_texture_matrix_words=g_ge_palette_draws=0;
+ }
+ 
+ }
+diff --git a/lcs/host/ge_renderer.hpp b/lcs/host/ge_renderer.hpp
+index cf03f66..a5032d7 100644
+--- a/lcs/host/ge_renderer.hpp
++++ b/lcs/host/ge_renderer.hpp
+@@ -5,10 +5,25 @@
+ #include <array>
+ #include <cstdint>
+ #include <string>
++#include <memory>
+ 
+ namespace lcs {
+ 
++struct GeClutState {
++    using Bytes = std::array<std::uint8_t, 1024>;
++    std::shared_ptr<const Bytes> snapshot;
++    std::uint32_t checksum{};
++    std::uint64_t loads{};
++    const Bytes &data() const noexcept {
++        static const Bytes zero{};
++        return snapshot ? *snapshot : zero;
++    }
++};
++void load_ge_clut(GeClutState &state, const psprecomp::GuestMemory &memory,
++                  std::uint32_t address, std::uint32_t blocks);
+ struct GeTransformState {
++    GeClutState clut;
++
+     std::array<float, 96> bones{};
+     std::array<float, 12> world{};
+     std::array<float, 12> view{};
+@@ -104,6 +119,7 @@ struct GePhaseTotals {
+     std::uint64_t gpu_accumulate_ns{};
+     std::uint64_t primitives{};
+     std::uint64_t vertices{};
++    std::uint64_t memo_hits{}, clut_loads{}, texture_matrix_words{}, palette_draws{};
+ };
+ void flush_ge_deferred_rasterization(psprecomp::GuestMemory &memory);
+ 
+diff --git a/lcs/host/lcs_android_build.cpp b/lcs/host/lcs_android_build.cpp
+index f47d0aa..f08378b 100644
+--- a/lcs/host/lcs_android_build.cpp
++++ b/lcs/host/lcs_android_build.cpp
+@@ -4,6 +4,6 @@
+ #endif
+ namespace lcs {
+ const char *android_build_identity() noexcept {
+-    return "LCS Android 0.6.11 source=" LCS_ANDROID_SOURCE_SHA;
++    return "LCS Android 0.6.12 source=" LCS_ANDROID_SOURCE_SHA;
+ }
+ }
+diff --git a/lcs/host/lcs_ge_exec.cpp b/lcs/host/lcs_ge_exec.cpp
+index 339b0f4..4382f28 100644
+--- a/lcs/host/lcs_ge_exec.cpp
++++ b/lcs/host/lcs_ge_exec.cpp
+@@ -62,7 +62,7 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
+             (command >= 0x2Au && command <= 0x41u))) ++ge_state_revision;
+         ge_commands[command] = data;
+ 
+-        if (command >= 0x2Au && command <= 0x3Fu)
++        if (command >= 0x2Au && command <= 0x41u)
+             update_ge_transform_state(ge_transform, command, data);
+ 
+         switch (command) {
+@@ -106,7 +106,16 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
+                               << " written=" << total_pixels_written << "\n";
+             }
+             return;
+-        case 0xC4u:  // CLUTLOAD
++        case 0xC4u: { // CLUTLOAD copies bytes into the GE internal palette.
++            flush_ge_deferred_rasterization(memory);
++            const std::uint32_t address = (ge_commands[0xB0u] & 0x00FFFFF0u) |
++                ((ge_commands[0xB1u] << 8u) & 0x0F000000u);
++            load_ge_clut(ge_transform.clut, memory, address, data);
++#if defined(__ANDROID__)
++            android_gles_texture_barrier();
++#endif
++            break;
++        }
+         case 0xCBu:  // TEXFLUSH
+         case 0xCCu:  // TEXSYNC
+ #if defined(__ANDROID__)
+diff --git a/lcs/host/lcs_ge_triangle_indices.hpp b/lcs/host/lcs_ge_triangle_indices.hpp
+new file mode 100644
+index 0000000..593acfe
+--- /dev/null
++++ b/lcs/host/lcs_ge_triangle_indices.hpp
+@@ -0,0 +1,21 @@
++#pragma once
++#include <cstdint>
++#include <vector>
++namespace lcs {
++inline void append_ge_triangle_indices(std::vector<std::uint32_t> &out,
++        std::uint32_t primitive, std::uint32_t count, std::uint32_t base) {
++    if (primitive == 3u) {
++        for (std::uint32_t i=0; i+2<count; i+=3) {
++            out.push_back(base+i);out.push_back(base+i+1);out.push_back(base+i+2);
++        }
++    } else if (primitive == 4u) {
++        for (std::uint32_t i=0; i+2<count; ++i) {
++            out.push_back(base+i+(i&1));out.push_back(base+i+1-(i&1));out.push_back(base+i+2);
++        }
++    } else if (primitive == 5u) {
++        for (std::uint32_t i=1; i+1<count; ++i) {
++            out.push_back(base);out.push_back(base+i);out.push_back(base+i+1);
++        }
++    }
++}
++}
+diff --git a/lcs/host/lcs_ge_vertex_memo.hpp b/lcs/host/lcs_ge_vertex_memo.hpp
+new file mode 100644
+index 0000000..3d0b532
+--- /dev/null
++++ b/lcs/host/lcs_ge_vertex_memo.hpp
+@@ -0,0 +1,38 @@
++#pragma once
++#include <array>
++#include <cstdint>
++#include <cstring>
++namespace lcs {
++template<class Vertex> class GeVertexMemo {
++    struct Entry { std::uint32_t generation{}; std::uint32_t size{};
++        std::array<std::uint8_t,64> bytes{}; Vertex vertex{}; };
++    std::array<Entry,256> slots_{};
++    std::uint32_t generation_{};
++public:
++    void begin() noexcept {
++        if (++generation_ == 0) {
++            for (auto &s:slots_) s.generation=0;
++            generation_=1;
++        }
++    }
++    template<class Decode> bool decode(const std::uint8_t *record, std::uint32_t size,
++                                      Vertex &out, bool &hit, Decode &&decode) {
++        hit=false;
++        if (!record || size==0 || size>64) return decode(out);
++        std::uint64_t hash=0x9E3779B97F4A7C15ull;
++        std::uint32_t i=0;
++        for (;i+8<=size;i+=8) {
++            std::uint64_t word;std::memcpy(&word,record+i,8);
++            hash=(hash^word)*0xBF58476D1CE4E5B9ull;
++        }
++        for (;i<size;++i) hash=(hash^record[i])*0x100000001B3ull;
++        auto &e=slots_[(hash^(hash>>32))&255u];
++        if (e.generation==generation_ && e.size==size && std::memcmp(e.bytes.data(),record,size)==0) {
++            out=e.vertex;hit=true;return true;
++        }
++        if (!decode(out)) return false;
++        e.generation=generation_;e.size=size;e.vertex=out;
++        std::memcpy(e.bytes.data(),record,size);return true;
++    }
++};
++}
+diff --git a/lcs/host/lcs_profile.cpp b/lcs/host/lcs_profile.cpp
+index a005f4a..974a3c9 100644
+--- a/lcs/host/lcs_profile.cpp
++++ b/lcs/host/lcs_profile.cpp
+@@ -2131,7 +2131,11 @@ void android_pipeline_report() {
+         <<" clipMs="<<ms(phase.triangle_prep_ns,previous.triangle_prep_ns)
+         <<" batchMs="<<ms(phase.gpu_accumulate_ns,previous.gpu_accumulate_ns)
+         <<" prims="<<(phase.primitives-previous.primitives)
+-        <<" vertices="<<(phase.vertices-previous.vertices);
++        <<" vertices="<<(phase.vertices-previous.vertices)
++        <<" vertexMemoHits="<<(phase.memo_hits-previous.memo_hits)
++        <<" clutLoads="<<(phase.clut_loads-previous.clut_loads)
++        <<" texMatrixWords="<<(phase.texture_matrix_words-previous.texture_matrix_words)
++        <<" paletteDraws="<<(phase.palette_draws-previous.palette_draws);
+     runtime_log_line(report.str());
+     previous=phase;before_ge=ge;before_gpu=gpu;before_wait=wait;frames=0;started=now;
+ }

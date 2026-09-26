@@ -47,7 +47,7 @@ public final class MainActivity extends Activity {
         System.loadLibrary("lcsrecomp");
     }
 
-    static native int nativeRun(String gameRoot, String configPath);
+    static native int nativeRun(String gameRoot, String configPath, int renderScale);
     static native void nativeSetSurface(android.view.Surface surface);
     static native void nativeSetDisplaySize(int width, int height);
     static native void nativeSetInput(int buttons, int analogX, int analogY,
@@ -146,6 +146,21 @@ public final class MainActivity extends Activity {
         infoParams.topMargin = 18;
         root.addView(info, infoParams);
 
+        Button scaleButton = new Button(this);
+        scaleButton.setText("Resolución interna: " + renderScale() + "× (tocar para cambiar)");
+        scaleButton.setOnClickListener(v -> {
+            int scale = renderScale() == 1 ? 2 : 1;
+            getSharedPreferences("graphics", MODE_PRIVATE).edit().putInt("render_scale", scale).apply();
+            scaleButton.setText("Resolución interna: " + scale + "× (tocar para cambiar)");
+        });
+        root.addView(scaleButton);
+        TextView scaleInfo = new TextView(this);
+        scaleInfo.setText("2× dibuja 4 veces más píxeles. 1× prioriza velocidad. Se aplica al iniciar.");
+        scaleInfo.setTextColor(Color.LTGRAY);
+        scaleInfo.setTextSize(12f);
+        scaleInfo.setGravity(Gravity.CENTER);
+        root.addView(scaleInfo);
+
         statusView = new TextView(this);
         String defaultStatus;
         if (hasGameFiles()) {
@@ -215,7 +230,10 @@ public final class MainActivity extends Activity {
         buttons.addView(playButton, playParams);
 
         root.addView(buttons, buttonsParams);
-        setContentView(root);
+        android.widget.ScrollView launcherScroll = new android.widget.ScrollView(this);
+        launcherScroll.setFillViewport(true);
+        launcherScroll.addView(root);
+        setContentView(launcherScroll);
     }
 
     private String loadPreviousCrashReport() {
@@ -668,6 +686,11 @@ public final class MainActivity extends Activity {
                     + "; el recompilado requiere exactamente v1.05.");
     }
 
+    private int renderScale() {
+        int scale = getSharedPreferences("graphics", MODE_PRIVATE).getInt("render_scale", 2);
+        return scale == 2 ? 2 : 1;
+    }
+
     private File ensureConfig() throws IOException {
         File config = new File(getFilesDir(), "LCSNative.ini");
 
@@ -684,7 +707,7 @@ public final class MainActivity extends Activity {
                 + "ShowFPS=false\n\n"
                 + "[Rendering]\n"
                 + "InternalResolutionMode=Scale\n"
-                + "InternalScale=1\n"
+                + "InternalScale=" + renderScale() + "\n"
                 + "MSAA=1\n"
                 + "HardwareTransform=false\n\n"
                 + "[Audio]\n"
@@ -776,7 +799,7 @@ public final class MainActivity extends Activity {
         final String configPath = config.getAbsolutePath();
 
         gameThread = new Thread(null, () -> {
-            int result = nativeRun(gameRoot, configPath);
+            int result = nativeRun(gameRoot, configPath, renderScale());
             synchronized (MainActivity.this) {
                 gameThread = null;
             }

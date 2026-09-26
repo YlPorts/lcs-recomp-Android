@@ -5,10 +5,25 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <memory>
 
 namespace lcs {
 
+struct GeClutState {
+    using Bytes = std::array<std::uint8_t, 1024>;
+    std::shared_ptr<const Bytes> snapshot;
+    std::uint32_t checksum{};
+    std::uint64_t loads{};
+    const Bytes &data() const noexcept {
+        static const Bytes zero{};
+        return snapshot ? *snapshot : zero;
+    }
+};
+void load_ge_clut(GeClutState &state, const psprecomp::GuestMemory &memory,
+                  std::uint32_t address, std::uint32_t blocks);
 struct GeTransformState {
+    GeClutState clut;
+
     std::array<float, 96> bones{};
     std::array<float, 12> world{};
     std::array<float, 12> view{};
@@ -104,6 +119,7 @@ struct GePhaseTotals {
     std::uint64_t gpu_accumulate_ns{};
     std::uint64_t primitives{};
     std::uint64_t vertices{};
+    std::uint64_t memo_hits{}, clut_loads{}, texture_matrix_words{}, palette_draws{};
 };
 void flush_ge_deferred_rasterization(psprecomp::GuestMemory &memory);
 

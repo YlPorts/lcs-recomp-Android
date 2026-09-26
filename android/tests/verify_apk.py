@@ -4,7 +4,7 @@ from pathlib import Path
 import hashlib, subprocess, sys, zipfile
 apk=Path(sys.argv[1])
 sha=subprocess.check_output(['git','rev-parse','--short=12','HEAD'],text=True).strip()
-expected=('LCS Android 0.6.11 source='+sha).encode()
+expected=('LCS Android 0.6.12 source='+sha).encode()
 with zipfile.ZipFile(apk) as z:
     name='lib/arm64-v8a/liblcsrecomp.so'; data=z.read(name)
     assert data[:5]==b'\x7fELF\x02' and int.from_bytes(data[18:20],'little')==183

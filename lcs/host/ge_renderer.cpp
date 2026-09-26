@@ -1,4 +1,5 @@
 #include "ge_renderer.hpp"
+#include "lcs_ge_vertex_memo.hpp"
 #include "ge_gpu_backend.hpp"
 #include "lcs_controls.hpp"
 #include "lcs_fps_overlay.hpp"
@@ -147,6 +148,10 @@ std::uint64_t g_ge_triangle_prep_ns{};
 std::uint64_t g_ge_gpu_accumulate_ns{};
 std::uint64_t g_ge_primitive_count{};
 std::uint64_t g_ge_vertex_count{};
+std::uint64_t g_ge_memo_hits{};
+std::uint64_t g_ge_clut_loads{};
+std::uint64_t g_ge_texture_matrix_words{};
+std::uint64_t g_ge_palette_draws{};
 
 struct PhaseTimer {
     std::uint64_t *sink;
@@ -455,6 +460,29 @@ void reset_ge_transform_state(GeTransformState &state) noexcept {
     state.morph_weights[0] = 1.0f;
 }
 
+void load_ge_clut(GeClutState &state, const psprecomp::GuestMemory &memory,
+                  std::uint32_t address, std::uint32_t blocks) {
+    const std::size_t count = std::min<std::size_t>((blocks & 63u) * 32u, 1024u);
+    if (count == 0u) return;
+    ++state.loads;
+    ++g_ge_clut_loads;
+    auto next = std::make_shared<GeClutState::Bytes>(state.data());
+    if (const auto *source = memory.raw_pointer(address, count))
+        std::memcpy(next->data(), source, count);
+    else {
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto a = static_cast<std::uint64_t>(address) + i;
+            (*next)[i] = a <= 0xFFFFFFFFull && memory.contains(static_cast<std::uint32_t>(a), 1)
+                ? memory.load8(static_cast<std::uint32_t>(a)) : 0;
+        }
+    }
+    if (state.snapshot && *next == *state.snapshot) return;
+    std::uint32_t checksum = 2166136261u;
+    for (auto b : *next) { checksum ^= b; checksum *= 16777619u; }
+    state.checksum = checksum;
+    state.snapshot = std::move(next);
+}
+
 void update_ge_transform_state(GeTransformState &state, std::uint32_t command,
                                std::uint32_t data) noexcept {
     switch (command) {
@@ -502,6 +530,7 @@ void update_ge_transform_state(GeTransformState &state, std::uint32_t command,
         state.texture_cursor = data & 0xFu;
         break;
     case 0x41u: {
+        ++g_ge_texture_matrix_words;
         const std::uint32_t index = state.texture_cursor & 0xFu;
         if (index < state.texture.size()) state.texture[index] = decode_float24(data);
         state.texture_cursor = (index + 1u) & 0xFu;
@@ -1858,6 +1887,7 @@ Color read_clut(const psprecomp::GuestMemory &memory, const std::array<std::uint
 }
 
 struct TextureSetup {
+    std::shared_ptr<const GeClutState::Bytes> clut_snapshot;
     const std::uint8_t *pixels{};
     const std::uint8_t *clut_pixels{};
     std::uint32_t base{};
@@ -1879,7 +1909,7 @@ struct TextureSetup {
     std::uint32_t selected_level{};
 };
 
-TextureSetup make_texture_setup_for_level(const psprecomp::GuestMemory &memory, const std::array<std::uint32_t, 256> &commands, std::uint32_t requested_level) noexcept {
+TextureSetup make_texture_setup_for_level(const psprecomp::GuestMemory &memory, const std::array<std::uint32_t, 256> &commands, std::uint32_t requested_level, const GeClutState *palette = nullptr) noexcept {
     TextureSetup setup{}; setup.selected_level=std::min<std::uint32_t>(requested_level,7u);
     const std::uint32_t size = data24(commands[0xB8u + setup.selected_level]);
     setup.width = 1u << (size & 0xFu);
@@ -1906,8 +1936,14 @@ TextureSetup make_texture_setup_for_level(const psprecomp::GuestMemory &memory, 
     const std::uint32_t row_bytes = setup.buffer_width * 4u;
     const std::uint64_t span = static_cast<std::uint64_t>(setup.height + 8u) * (row_bytes + 128u);
     setup.pixels = memory.raw_pointer(setup.base, static_cast<std::size_t>(span));
-    setup.clut_pixels = memory.raw_pointer(setup.clut_base,
+    if (palette != nullptr) {
+        // Read the internal palette, not whatever RAM happens to contain now.
+        setup.clut_snapshot = palette->snapshot;
+        setup.clut_pixels = palette->data().data();
+    } else {
+        setup.clut_pixels = memory.raw_pointer(setup.clut_base,
                                            (setup.clut_wrap_mask + 1u) * setup.clut_entry_bytes);
+    }
     return setup;
 }
 
@@ -4121,33 +4157,9 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         gpu_draw.vertex_count = count;
 
         gpu_draw.clut_checksum = 0u;
-        if (gpu_draw.texture_format >= 4u && gpu_draw.texture_format <= 7u &&
-            gpu_draw.clut_address != 0u) {
-            const std::uint32_t entry_bytes = gpu_draw.clut_format == 3u ? 4u : 2u;
-            const std::uint32_t first = std::min(gpu_draw.clut_start, 255u);
-            const std::uint32_t last = std::min(first + gpu_draw.clut_mask, 255u);
-            const std::uint32_t offset_bytes = first * entry_bytes;
-            const std::uint32_t clut_bytes = (last - first + 1u) * entry_bytes;
-            if (const std::uint8_t *clut = memory.raw_pointer(
-                    gpu_draw.clut_address + offset_bytes, clut_bytes)) {
-                std::uint32_t checksum = 2166136261u;
-                std::uint32_t offset = 0u;
-                for (; offset + 4u <= clut_bytes; offset += 4u) {
-                    const std::uint32_t word = static_cast<std::uint32_t>(clut[offset]) |
-                        (static_cast<std::uint32_t>(clut[offset + 1u]) << 8u) |
-                        (static_cast<std::uint32_t>(clut[offset + 2u]) << 16u) |
-                        (static_cast<std::uint32_t>(clut[offset + 3u]) << 24u);
-                    checksum ^= word;
-                    checksum *= 16777619u;
-                }
-                if (offset < clut_bytes) {
-                    std::uint32_t tail = clut[offset];
-                    if (offset + 1u < clut_bytes) tail |= static_cast<std::uint32_t>(clut[offset + 1u]) << 8u;
-                    checksum ^= tail;
-                    checksum *= 16777619u;
-                }
-                gpu_draw.clut_checksum = checksum;
-            }
+        if (gpu_draw.texture_enabled && gpu_draw.texture_format >= 4u && gpu_draw.texture_format <= 7u) {
+            gpu_draw.clut_checksum = transform.clut.checksum;
+            ++g_ge_palette_draws;
         }
         ge_gpu_backend_prepare_texture_keys(gpu_draw);
         gpu_draw.texture_content_signature = 0u;
@@ -4159,7 +4171,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             std::uint64_t signature = 0xCBF29CE484222325ull;
             bool any_signature = false;
             for (std::uint32_t level = 0u; level < signature_levels; ++level) {
-                const TextureSetup source = make_texture_setup_for_level(memory, commands, level);
+                const TextureSetup source = make_texture_setup_for_level(memory, commands, level, &transform.clut);
                 const std::uint64_t part = texture_source_signature(memory, source);
                 if (part == 0u) continue;
                 any_signature = true;
@@ -4225,7 +4237,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         std::size_t total_bytes = 0u;
         bool all = true;
         for (std::uint32_t level = 0u; level < level_count; ++level) {
-            mip_setups[level] = make_texture_setup_for_level(memory, commands, level);
+            mip_setups[level] = make_texture_setup_for_level(memory, commands, level, &transform.clut);
             const std::uint64_t bytes = static_cast<std::uint64_t>(mip_setups[level].width) *
                                         mip_setups[level].height * 4ull;
             if (bytes > std::numeric_limits<std::size_t>::max() - total_bytes) {
@@ -4659,6 +4671,8 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
     {
         PhaseTimer bind_timer(g_ge_draw_setup_ns);
         bind_fragment_buffers(setup, memory, commands);
+        setup.texture = make_texture_setup_for_level(memory, commands,
+            selected_texture_level(commands), &transform.clut);
     }
 
     static thread_local std::vector<Vertex> vertices;
@@ -4676,6 +4690,11 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         const PreparedLighting primitive_lighting = prepare_lighting(layout.color_type >= 4u, commands);
         static thread_local VertexLightingCache primitive_light_cache;
         primitive_light_cache.begin(primitive_lighting);
+        static thread_local GeVertexMemo<Vertex> primitive_vertex_cache;
+        primitive_vertex_cache.begin();
+        const bool memo_enabled = gpu_backend_enabled && layout.index_type==0u &&
+            !layout.through && count>=12u && layout.stride<=64u &&
+            (primitive_lighting.enabled || layout.weight_type!=0u || layout.morph_count>1u);
 #if defined(__ANDROID__)
         const float primitive_x_scale = layout.through ? 1.0f : android_ultrawide_x_scale();
 #endif
@@ -4697,8 +4716,15 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
                 static_cast<std::uint32_t>(source_address), layout.stride);
             if (record == nullptr) { error = "GE vertex record outside guest memory"; return false; }
             const VertexByteView record_view{record, layout.stride};
-            if (!decode_vertex_optimized(record_view, 0u, layout,
-                                         commands, transform, vertex, error, &primitive_lighting, &primitive_light_cache)) return false;
+            const auto decode = [&](Vertex &out) {
+                return decode_vertex_optimized(record_view, 0u, layout,
+                    commands, transform, out, error, &primitive_lighting, &primitive_light_cache);
+            };
+            bool memo_hit=false;
+            if (memo_enabled) {
+                if (!primitive_vertex_cache.decode(record,layout.stride,vertex,memo_hit,decode)) return false;
+                if (memo_hit) ++g_ge_memo_hits;
+            } else if (!decode(vertex)) return false;
 #if defined(__ANDROID__)
             // SurfaceFlinger stretches the low-resolution producer buffer to the
             // physical ultrawide display. Compress 3D clip X by the inverse
@@ -4958,6 +4984,7 @@ GePhaseTotals ge_phase_totals() noexcept {
         g_ge_draw_setup_ns, g_ge_texture_upload_ns, g_ge_vertex_decode_ns,
         g_ge_gpu_stage_ns, g_ge_triangle_prep_ns, g_ge_gpu_accumulate_ns,
         g_ge_primitive_count, g_ge_vertex_count,
+        g_ge_memo_hits, g_ge_clut_loads, g_ge_texture_matrix_words, g_ge_palette_draws,
     };
 }
 
@@ -4972,6 +4999,7 @@ void reset_ge_phase_totals() noexcept {
     g_ge_gpu_accumulate_ns = 0u;
     g_ge_primitive_count = 0u;
     g_ge_vertex_count = 0u;
+    g_ge_memo_hits=g_ge_clut_loads=g_ge_texture_matrix_words=g_ge_palette_draws=0;
 }
 
 }
