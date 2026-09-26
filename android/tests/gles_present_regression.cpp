@@ -13,6 +13,7 @@ void runtime_log_error(std::string_view, std::string_view text) { std::cerr << t
 namespace android_host {
 void set_source_size(std::uint32_t, std::uint32_t) noexcept {}
 float ultrawide_x_scale() noexcept { return 1; }
+float geometry_x_scale() noexcept { return 1; }
 }
 }
 using namespace lcs;

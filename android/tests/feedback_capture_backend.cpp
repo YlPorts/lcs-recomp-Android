@@ -11,6 +11,7 @@ void runtime_log_error(std::string_view,std::string_view text){std::cerr<<text<<
 namespace android_host {
 void set_source_size(std::uint32_t,std::uint32_t) noexcept{}
 float ultrawide_x_scale() noexcept{return 1;}
+float geometry_x_scale() noexcept { return 1; }
 }
 }
 std::vector<lcs::GeGpuVertex> vertices(std::uint32_t color,float depth){

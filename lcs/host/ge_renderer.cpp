@@ -586,8 +586,13 @@ inline float android_ultrawide_x_scale() noexcept {
     return std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
 }
 
+inline float android_geometry_x_scale() noexcept {
+    const float scale = android_host::geometry_x_scale();
+    return std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
+}
+
 inline void apply_android_3d_ultrawide(Vertex &vertex) noexcept {
-    const float scale = android_ultrawide_x_scale();
+    const float scale = android_geometry_x_scale();
     if (std::abs(scale - 1.0f) >= 0.001f)
         vertex.x *= scale;
 }
@@ -4059,7 +4064,7 @@ bool test_ge_bounding_box(const psprecomp::GuestMemory &memory,
         if (!std::isfinite(vertex.x+vertex.y+vertex.z+vertex.w)) { result.visible=true; return true; }
 #if defined(__ANDROID__)
         // The test must match the actual widened camera, not the narrower PSP view.
-        vertex.x *= android_ultrawide_x_scale();
+        vertex.x *= android_geometry_x_scale();
 #endif
 
         if (layout.through) {
@@ -4416,7 +4421,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         return !v||std::strcmp(v,"0")!=0;
     }();
     if(early_positions&&gpu_only_triangle_path&&primitive>=3u&&primitive<=5u&&!gpu_draw.clear_mode){
-        const float scale=android_ultrawide_x_scale();
+        const float scale=android_geometry_x_scale();
         if(ge_position_only_outside(memory,commands,transform,layout,vertex_address,index_address,count,scale)){
             ++g_trivial_rejects;advance_stream();return true;
         }
@@ -4908,7 +4913,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             !layout.through && count>=6u && layout.stride<=64u &&
             (primitive_lighting.enabled || layout.weight_type!=0u || layout.morph_count>1u);
 #if defined(__ANDROID__)
-        const float primitive_x_scale = layout.through ? 1.0f : android_ultrawide_x_scale();
+        const float primitive_x_scale = layout.through ? 1.0f : android_geometry_x_scale();
 #endif
         const std::uint64_t stream_bytes = std::uint64_t(count) * layout.stride;
         const std::uint8_t *stream_raw = layout.index_type==0u && stream_bytes<=SIZE_MAX
@@ -4959,10 +4964,9 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
                 if (memo_hit) ++g_ge_memo_hits;
             } else if (!decode(vertex)) return false;
 #if defined(__ANDROID__)
-            // SurfaceFlinger stretches the low-resolution producer buffer to the
-            // physical ultrawide display. Compress 3D clip X by the inverse
-            // aspect stretch so the result gains horizontal FOV instead of
-            // making characters/cars look fat.
+            // Guest camera/frustum hooks now widen 3D before visibility tests.
+            // A late correction is only the disabled-hook fallback, and must
+            // match the BBOX and early-position paths above.
             if (!layout.through && std::abs(primitive_x_scale - 1.0f) >= 0.001f)
                 vertex.x *= primitive_x_scale;
 #endif
@@ -4978,7 +4982,24 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
     }
 
 #if defined(__ANDROID__)
-    if (layout.through && !setup.clear_mode && !vertices.empty()) {
+    // Through coordinates also address offscreen maps. Screen-centered HUD
+    // transforms would move a small reflection map outside its own REGION2.
+    // Recognize display-sized backbuffers by their layout, not their address:
+    // the game may draw the next buffer before changing the displayed one.
+    bool android_screen_overlay=false;
+    if (layout.through && gpu_backend_enabled) {
+        std::uint32_t display_width=480u, display_height=272u;
+        ge_gpu_backend_display_logical_size(display_width,display_height);
+        android_screen_overlay = gpu_draw.framebuffer_stride >= display_width &&
+            (!gpu_draw.region_defined ||
+                (gpu_draw.region_x1 >= static_cast<std::int32_t>(display_width)-1 &&
+                 gpu_draw.region_y1 >= static_cast<std::int32_t>(display_height)-1)) &&
+            // Screen-space world effects still use scene depth; match the
+            // existing HUD scale exclusion for these read-only-depth draws.
+            !(setup.depth_test_enabled && !setup.depth_write_enabled) &&
+            !(gpu_draw.texture_enabled && ge_gpu_backend_is_framebuffer_feedback_texture(gpu_draw));
+    }
+    if (layout.through && android_screen_overlay && !setup.clear_mode && !vertices.empty()) {
         const float scale = android_ultrawide_x_scale();
         if (std::abs(scale - 1.0f) >= 0.001f) {
             float min_x = vertices.front().x;
@@ -5001,7 +5022,11 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
     }
 #endif
 
-    if (layout.through && gpu_backend_enabled && !vertices.empty()) {
+    if (layout.through && gpu_backend_enabled && !vertices.empty()
+#if defined(__ANDROID__)
+        && android_screen_overlay
+#endif
+    ) {
         float min_x = vertices.front().x;
         float max_x = vertices.front().x;
         float max_y = vertices.front().y;

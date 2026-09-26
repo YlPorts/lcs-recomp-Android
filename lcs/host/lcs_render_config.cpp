@@ -1,5 +1,8 @@
 #include "lcs_render_config.hpp"
 #include "lcs_widescreen.hpp"
+#if defined(__ANDROID__)
+#include "android_host.hpp"
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -751,8 +754,22 @@ float widescreen_stretch_factor(const LcsConfiguration &configuration,
 float widescreen_render_stretch() noexcept {
     const LcsConfiguration &config = lcs_render_configuration();
     if (!config.initialized || !config.widescreen.enabled) return 1.0f;
+#if defined(__ANDROID__)
+    // The guest camera/frustum hooks must see the physical SurfaceView aspect
+    // before deciding which world objects to submit. Internal PSP/FBO sizes
+    // describe render resolution and include offscreen targets, not the phone.
+    const auto width=android_host::display_width();
+    const auto height=android_host::display_height();
+    if (config.widescreen.aspect_x!=0u && config.widescreen.aspect_y!=0u)
+        return widescreen_stretch_factor(config,width,height);
+    // The activity runs in landscape. A not-yet-laid-out or transient portrait
+    // surface keeps the native camera until its physical landscape size arrives.
+    if (width==0u || height==0u || width<height) return 1.0f;
+    return widescreen_stretch_factor(config,width,height);
+#else
     const InternalResolutionDimensions target = resolve_internal_resolution(config.rendering);
     return widescreen_stretch_factor(config, target.width, target.height);
+#endif
 }
 
 float lcs_widescreen_aspect(float native_aspect) noexcept {
@@ -763,5 +780,18 @@ float lcs_widescreen_aspect(float native_aspect) noexcept {
 float lcs_widescreen_extent(float native_extent) noexcept {
     return native_extent * widescreen_render_stretch();
 }
+
+#if defined(__ANDROID__)
+namespace android_host {
+float geometry_x_scale() noexcept {
+    const auto &config=lcs_render_configuration();
+    // The guest projection and visibility calculations already include the
+    // physical aspect. A second clip-space correction would widen only GE output
+    // and leave the guest frustum narrower again. HUD scaling is independent.
+    if (config.initialized && config.widescreen.enabled) return 1.0f;
+    return ultrawide_x_scale();
+}
+}
+#endif
 
 }

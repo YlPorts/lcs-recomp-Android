@@ -32,7 +32,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Verify direct 0.6.17 source
+      - name: Verify direct 0.6.18 source
         run: |
           python3 android/tests/scale_config_regression.py
           python3 android/tests/capture_ui_contract.py
@@ -127,6 +127,18 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y glslang-tools ccache libegl1-mesa-dev libgles2-mesa-dev
+      - name: Android physical camera aspect regression
+        run: |
+          set -euo pipefail
+          FLAGS="-std=c++20 -O2 -D__ANDROID__ -ffunction-sections -fdata-sections -Iandroid/tests/shim -Iandroid/app/src/main/cpp -Iinclude -Ilcs/host"
+          g++ $FLAGS android/tests/android_camera_aspect_regression.cpp src/guest_memory.cpp -Wl,--gc-sections -pthread -o /tmp/camera-aspect
+          /tmp/camera-aspect | tee android/test-results/camera-aspect.txt
+          git show e456abb5da7983079c4e3270d1cfaa1fea97368b:lcs/host/ge_renderer.cpp > /tmp/camera-renderer-before.cpp
+          git show e456abb5da7983079c4e3270d1cfaa1fea97368b:lcs/host/lcs_render_config.cpp > /tmp/camera-config-before.cpp
+          g++ $FLAGS -DLCS_BASELINE_TEST '-DLCS_TEST_RENDERER="/tmp/camera-renderer-before.cpp"' '-DLCS_TEST_CONFIG="/tmp/camera-config-before.cpp"' android/tests/android_camera_aspect_regression.cpp src/guest_memory.cpp -Wl,--gc-sections -pthread -o /tmp/camera-aspect-before
+          baseline_status=0
+          /tmp/camera-aspect-before > android/test-results/camera-aspect-before.txt 2>&1 || baseline_status=$?
+          if [ "$baseline_status" -ne 20 ]; then cat android/test-results/camera-aspect-before.txt; exit 1; fi
       - name: Actual GLES backend regression tests
         run: |
           g++ -std=c++20 -O2 -ffunction-sections -fdata-sections -Iinclude -Ilcs/host -c android/tests/reference_fragments.cpp -o /tmp/reference-fragments.o
@@ -182,6 +194,23 @@ jobs:
           baseline_status=0
           /tmp/vehicle-feedback-before > android/test-results/vehicle-feedback-before.txt 2>&1 || baseline_status=$?
           if [ "$baseline_status" -ne 20 ]; then cat android/test-results/vehicle-feedback-before.txt; echo "Expected the 0.6.16 stale-green reproduction"; exit 1; fi
+      - name: Offscreen reflection and HUD coordinate regression
+        run: |
+          set -euo pipefail
+          FLAGS="-std=c++20 -O2 -D__ANDROID__ -ffunction-sections -fdata-sections -Iinclude -Iandroid/tests/shim -Iandroid/app/src/main/cpp -Ilcs/host"
+          g++ $FLAGS android/tests/gles_offscreen_hud_regression.cpp lcs/host/ge_renderer.cpp src/guest_memory.cpp lcs/host/lcs_android_build.cpp lcs/host/lcs_render_capture.cpp -Wl,--gc-sections -lEGL -lGLESv2 -pthread -o /tmp/gles-offscreen-hud
+          /tmp/gles-offscreen-hud | tee android/test-results/offscreen-hud-fetch.txt
+          PSPRECOMP_GLES_FB_FETCH=0 /tmp/gles-offscreen-hud | tee android/test-results/offscreen-hud-copy.txt
+          git show e456abb5da7983079c4e3270d1cfaa1fea97368b:lcs/host/ge_renderer.cpp > /tmp/ge-renderer-hud-before.cpp
+          g++ $FLAGS android/tests/gles_offscreen_hud_regression.cpp /tmp/ge-renderer-hud-before.cpp src/guest_memory.cpp lcs/host/lcs_android_build.cpp lcs/host/lcs_render_capture.cpp -Wl,--gc-sections -lEGL -lGLESv2 -pthread -o /tmp/gles-offscreen-hud-before
+          baseline_status=0
+          /tmp/gles-offscreen-hud-before > android/test-results/offscreen-hud-before.txt 2>&1 || baseline_status=$?
+          if [ "$baseline_status" -ne 31 ]; then cat android/test-results/offscreen-hud-before.txt; exit 1; fi
+      - name: Surface texture recovery regression
+        run: |
+          set -euo pipefail
+          g++ -std=c++20 -O2 -D__ANDROID__ -Iandroid/tests/shim -Iandroid/app/src/main/cpp -Ilcs/host -Iinclude android/tests/gles_surface_texture_regression.cpp lcs/host/lcs_android_build.cpp lcs/host/lcs_render_capture.cpp -pthread -lEGL -lGLESv2 -o /tmp/gles-surface-texture
+          /tmp/gles-surface-texture | tee android/test-results/surface-texture-recovery.txt
       - name: Validate shader sources
         run: |
           python3 - <<'PY'
@@ -207,14 +236,14 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD > android/test-results/source-commit.txt
-          git archive --format=tar.gz -o /tmp/LCSRecomp-Android-0.6.17-source.tar.gz HEAD
+          git archive --format=tar.gz -o /tmp/LCSRecomp-Android-0.6.18-source.tar.gz HEAD
           git -C android/.deps/ffmpeg-source archive --prefix=FFmpeg-7.1.5/ --format=tar.gz -o /tmp/LCS-FFmpeg-7.1.5-source.tar.gz HEAD
       - name: Upload source and tests
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.17-source-and-tests
+          name: LCSRecomp-Android-0.6.18-source-and-tests
           path: |
-            /tmp/LCSRecomp-Android-0.6.17-source.tar.gz
+            /tmp/LCSRecomp-Android-0.6.18-source.tar.gz
             /tmp/LCS-FFmpeg-7.1.5-source.tar.gz
             android/test-results/
       - name: Java 17
@@ -276,7 +305,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.17-arm64-debug
+          name: LCSRecomp-Android-0.6.18-arm64-debug
           path: |
             android/app/build/outputs/apk/debug/app-debug.apk
             android/app/build/outputs/apk/debug/app-debug.apk.sha256
@@ -286,5 +315,5 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.17-failed-test-results
+          name: LCSRecomp-Android-0.6.18-failed-test-results
           path: android/test-results/

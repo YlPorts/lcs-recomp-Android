@@ -14,10 +14,13 @@ void set_source_size(std::uint32_t width, std::uint32_t height) noexcept;
 [[nodiscard]] std::uint32_t source_width() noexcept;
 [[nodiscard]] std::uint32_t source_height() noexcept;
 
-// Horizontal clip/screen correction used before Android stretches the game's
-// low-resolution native buffer to the physical ultrawide SurfaceView.
-// Values below 1 widen the visible game world while preserving object shape.
+// Screen-space HUD correction for Android's stretched low-resolution buffer.
 [[nodiscard]] float ultrawide_x_scale() noexcept;
+
+// Three-dimensional geometry normally needs no late correction: the guest
+// camera/frustum hooks already use the physical display aspect. Retain the
+// legacy fallback only when those hooks are disabled or not initialized.
+[[nodiscard]] float geometry_x_scale() noexcept;
 
 void set_input(std::uint32_t buttons, std::uint8_t analog_x, std::uint8_t analog_y,
                int camera_x, int camera_y, bool accelerate, bool brake) noexcept;

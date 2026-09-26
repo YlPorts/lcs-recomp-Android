@@ -69,6 +69,16 @@ struct GlesTexture {
     std::uint64_t byte_size{};
 };
 
+// Surface recreation keeps the EGL context, but decoding can run while no
+// Android window is attached. Preserve those pixels until GL can upload them.
+struct GlesPendingTexture {
+    GeGpuDrawDescriptor draw{};
+    std::uint32_t width{}, height{}, levels{};
+    std::vector<std::byte> rgba;
+};
+constexpr std::size_t kPendingTextureByteLimit = 32u * 1024u * 1024u;
+constexpr std::size_t kPendingTextureEntryLimit = 1024u;
+
 struct GlesDepth {
     GLuint id{};
     bool initialized{};
@@ -219,6 +229,9 @@ struct GlesState {
 
     std::unordered_map<std::uint64_t, GlesTexture> textures;
     android_detail::TextureVersions texture_versions;
+    std::unordered_map<std::uint64_t, GlesPendingTexture> pending_textures;
+    std::size_t pending_texture_bytes{};
+    bool texture_upload_frame_incomplete{};
     std::vector<GlesStreamVertex> frame_vertices;
     std::array<GlesGeometrySlot,3> geometry_slots{};
     std::size_t geometry_slot{};
@@ -774,6 +787,8 @@ void main() {
     return true;
 }
 
+bool flush_pending_textures(GlesState &s, std::string &error);
+
 bool ensure_context(GlesState &s, std::string &error) {
     if (!s.enabled) {
         error = "GLES backend disabled";
@@ -782,7 +797,8 @@ bool ensure_context(GlesState &s, std::string &error) {
 
     const std::thread::id current_thread = std::this_thread::get_id();
     if (s.gl_ready && s.gl_thread == current_thread && s.surface != EGL_NO_SURFACE &&
-        !s.surface_dirty.load(std::memory_order_acquire)) return true;
+        !s.surface_dirty.load(std::memory_order_acquire))
+        return flush_pending_textures(s, error);
     if (s.gl_ready && s.gl_thread != std::thread::id{} &&
         s.gl_thread != current_thread) {
         error = "OpenGL ES context attempted from a second native thread";
@@ -880,7 +896,7 @@ bool ensure_context(GlesState &s, std::string &error) {
         runtime_log_line(std::string("gles ge renderer=") +
                          (renderer != nullptr ? renderer : "unknown"));
     }
-    return true;
+    return flush_pending_textures(s, error);
 }
 
 std::uint64_t hash_mix(std::uint64_t hash, std::uint64_t value) noexcept {
@@ -1113,6 +1129,7 @@ bool ensure_target(GlesState &s, GlesTarget &target, std::string &error) {
     target.allocation_width = logical_width;
     target.allocation_height = logical_height;
 
+
     if (s.frame_epoch <= 12u) {
         runtime_log_line("gles: create target " +
                          std::to_string(render_width) + "x" +
@@ -1288,10 +1305,10 @@ void set_transform_uniforms(
         (2.0f / static_cast<float>(std::max<std::uint32_t>(1u, logical_width)));
     float x_b = (hw.viewport_center_x - hw.viewport_offset_x) *
         (2.0f / static_cast<float>(std::max<std::uint32_t>(1u, logical_width))) - 1.0f;
-    // Match the CPU ultrawide correction when hardware transform is enabled:
-    // compress clip X before the final SurfaceView stretch, yielding extra
-    // horizontal field of view instead of stretched geometry.
-    const float ultrawide = android_host::ultrawide_x_scale();
+    // Match the CPU geometry policy. Guest camera/frustum hooks already use
+    // the physical aspect, so the normal scale is 1; only disabled or
+    // uninitialized hooks retain the legacy late clip-space correction.
+    const float ultrawide = android_host::geometry_x_scale();
     if (std::isfinite(ultrawide) && ultrawide > 0.0f) {
         x_a *= ultrawide;
         x_b *= ultrawide;
@@ -1826,6 +1843,9 @@ void destroy_backend(GlesState &s) noexcept {
     s.config = {};
     s.batches.clear();
     s.last_texture_rgba.clear();
+    s.pending_textures.clear();
+    s.pending_texture_bytes = 0u;
+    s.texture_upload_frame_incomplete = false;
 
     {
         std::lock_guard<std::mutex> guard(s.window_mutex);
@@ -1975,7 +1995,12 @@ bool ge_gpu_backend_texture_needed(
     }
 
     ++s.report.texture_decode_requests;
-    const auto found = s.textures.find(texture_lookup_key(draw));
+    const auto key = texture_lookup_key(draw);
+    if (s.pending_textures.contains(key)) {
+        ++s.report.texture_cache_hits;
+        return false;
+    }
+    const auto found = s.textures.find(key);
     if (found == s.textures.end()) return true;
 
     found->second.signature_epoch = s.frame_epoch;
@@ -2039,7 +2064,11 @@ bool ge_gpu_backend_texture_available(
         feedback_target(s, draw.texture_address);
     if (target != s.targets.end()) return true;
 
-    const auto found = s.textures.find(texture_lookup_key(draw));
+    const auto key = texture_lookup_key(draw);
+    // Deferred pixels are ready for batching/UV normalization. ensure_context
+    // flushes every pending version before any batch can execute or present.
+    if (s.pending_textures.contains(key)) return true;
+    const auto found = s.textures.find(key);
     if (found == s.textures.end() || found->second.id == 0u) return false;
     found->second.last_used_epoch = s.frame_epoch;
     return true;
@@ -2071,29 +2100,12 @@ bool ge_gpu_backend_upload_decoded_texture_chain(
         static_cast<std::uint32_t>(levels.size()), std::move(packed));
 }
 
-bool ge_gpu_backend_upload_decoded_texture_chain_packed(
-    const GeGpuDrawDescriptor &draw,
-    std::uint32_t base_width, std::uint32_t base_height,
-    std::uint32_t mip_levels, std::vector<std::byte> rgba8) noexcept {
-    GlesState &s = state();
-    if (!s.enabled || base_width == 0u || base_height == 0u ||
-        mip_levels == 0u || rgba8.empty())
-        return false;
-    if (base_width > 2048u || base_height > 2048u || mip_levels > 8u) {
-        ++s.report.rejected_texture_decodes;
-        runtime_log_line("gles: rejected oversized texture " +
-                         std::to_string(base_width) + "x" +
-                         std::to_string(base_height));
-        return false;
-    }
+namespace {
 
-    std::string error;
-    if (!ensure_context(s, error)) {
-        s.report.message = error;
-        return false;
-    }
-
-    const std::uint64_t key = texture_lookup_key(draw);
+// Requires a current context; rgba is moved only after a complete GL upload.
+bool upload_texture_now(GlesState &s, const GeGpuDrawDescriptor &draw,
+    std::uint64_t key, std::uint32_t base_width, std::uint32_t base_height,
+    std::uint32_t mip_levels, std::vector<std::byte> &rgba8) {
 
     auto [texture_it, inserted] = s.textures.try_emplace(key);
     GlesTexture &texture = texture_it->second;
@@ -2160,6 +2172,15 @@ bool ge_gpu_backend_upload_decoded_texture_chain_packed(
     // safer than deleting a texture still needed by queued draw batches.
     trim_texture_cache(s, false);
 
+    if (glGetError() != GL_NO_ERROR) {
+        // Never expose a partially uploaded image as a cache hit. Keep the
+        // caller's decoded bytes intact so a deferred upload can retry.
+        if (texture.id) glDeleteTextures(1, &texture.id);
+        s.texture_cache_bytes -= std::min(s.texture_cache_bytes, texture.byte_size);
+        s.textures.erase(texture_it);
+        return false;
+    }
+
     // This is only diagnostic state. Move ownership instead of retaining a
     // second transient copy of each freshly decoded texture.
     const auto uploaded_size=rgba8.size();
@@ -2172,7 +2193,89 @@ bool ge_gpu_backend_upload_decoded_texture_chain_packed(
     s.report.last_texture_width = base_width;
     s.report.last_texture_height = base_height;
     s.report.last_texture_format = draw.texture_format;
-    return glGetError() == GL_NO_ERROR;
+    return true;
+}
+
+
+bool stage_texture(GlesState &s, const GeGpuDrawDescriptor &draw,
+    std::uint32_t width, std::uint32_t height, std::uint32_t levels,
+    std::vector<std::byte> rgba) {
+    const auto key = texture_lookup_key(draw);
+    if (s.pending_textures.contains(key)) return true;
+    if (s.pending_textures.size() >= kPendingTextureEntryLimit ||
+        rgba.size() > kPendingTextureByteLimit - s.pending_texture_bytes) {
+        s.texture_upload_frame_incomplete = true;
+        ++s.report.rejected_texture_decodes;
+        s.report.message = "Deferred texture budget exceeded; skipping incomplete frame";
+        return false;
+    }
+    const auto bytes = rgba.size();
+    try {
+        s.pending_textures.emplace(key,
+            GlesPendingTexture{draw, width, height, levels, std::move(rgba)});
+    } catch (...) {
+        s.texture_upload_frame_incomplete = true;
+        return false;
+    }
+    s.pending_texture_bytes += bytes;
+    return true;
+}
+
+bool flush_pending_textures(GlesState &s, std::string &error) {
+    for (auto it = s.pending_textures.begin(); it != s.pending_textures.end();) {
+        auto &pending = it->second;
+        const auto bytes = pending.rgba.size();
+        if (!upload_texture_now(s, pending.draw, it->first, pending.width, pending.height,
+                                pending.levels, pending.rgba)) {
+            error = "Deferred texture upload failed; retaining decoded pixels";
+            return false;
+        }
+        s.pending_texture_bytes -= bytes;
+        it = s.pending_textures.erase(it);
+    }
+    return true;
+}
+
+} // namespace
+
+bool ge_gpu_backend_upload_decoded_texture_chain_packed(
+    const GeGpuDrawDescriptor &draw,
+    std::uint32_t base_width, std::uint32_t base_height,
+    std::uint32_t mip_levels, std::vector<std::byte> rgba8) noexcept {
+    GlesState &s = state();
+    if (!s.enabled || base_width == 0u || base_height == 0u ||
+        mip_levels == 0u || rgba8.empty())
+        return false;
+    if (base_width > 2048u || base_height > 2048u || mip_levels > 8u) {
+        ++s.report.rejected_texture_decodes;
+        runtime_log_line("gles: rejected oversized texture " +
+                         std::to_string(base_width) + "x" +
+                         std::to_string(base_height));
+        return false;
+    }
+    // Validate before staging: no malformed chain may count as available.
+    std::size_t required = 0u;
+    auto width = base_width, height = base_height;
+    for (std::uint32_t level = 0u; level < mip_levels; ++level) {
+        required += static_cast<std::size_t>(width) * height * 4u;
+        width = std::max(1u, width >> 1u);
+        height = std::max(1u, height >> 1u);
+    }
+    if (rgba8.size() < required) return false;
+
+    // Freeze the content version, since another GE draw at the same guest
+    // address may observe different contents before the surface is attached.
+    const auto frozen = snapshot_texture_draw(draw);
+    std::string error;
+    if (!ensure_context(s, error)) {
+        s.report.message = error;
+        return stage_texture(s, frozen, base_width, base_height, mip_levels,
+                             std::move(rgba8));
+    }
+    if (upload_texture_now(s, frozen, texture_lookup_key(frozen), base_width, base_height, mip_levels, rgba8))
+        return true;
+    return stage_texture(s, frozen, base_width, base_height, mip_levels,
+                         std::move(rgba8));
 }
 
 bool ge_gpu_backend_copy_last_texture_rgba(
@@ -2579,6 +2682,18 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     if (!ensure_context(s, error)) {
         s.report.message = error;
         s.direct_present_ok = false;
+        return false;
+    }
+
+    if (s.texture_upload_frame_incomplete) {
+        // A bounded staging failure must never turn a required texture into
+        // a visible white/untextured draw. Keep the previous presented image;
+        // retry the missing decode with the next complete GE frame.
+        recycle_batches(s);
+        s.texture_upload_frame_incomplete = false;
+        s.report.message = "Skipped frame with a rejected deferred texture";
+        ++s.frame_epoch;
+        ++s.validation_epoch;
         return false;
     }
 
