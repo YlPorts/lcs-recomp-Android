@@ -1,6 +1,9 @@
 #include "lcs_ge_exec.hpp"
 
 #include "ge_renderer.hpp"
+#if defined(__ANDROID__)
+#include "lcs_android_gpu_policy.hpp"
+#endif
 #include "psprecomp/common.hpp"
 
 #include <array>
@@ -17,6 +20,7 @@ std::uint32_t ge_base_register = 0u;
 std::uint32_t ge_offset_address = 0u;
 std::uint32_t ge_vertex_address = 0u;
 std::uint32_t ge_index_address = 0u;
+std::uint64_t ge_state_revision = 1u;
 bool ge_finish_seen = false;
 std::uint32_t ge_finish_arg = 0u;
 
@@ -33,6 +37,10 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
     ge_finish_seen = false;
     ge_finish_arg = 0u;
     if (list_address == 0u) return;
+#if defined(__ANDROID__)
+    // New list: revalidate content but keep images pinned by queued draws.
+    android_gles_texture_barrier();
+#endif
 
     static const bool diag = std::getenv("LCS_GE_RENDER_DIAG") != nullptr;
     std::uint64_t total_pixels_tested = 0u;
@@ -49,6 +57,9 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
         pc = (pc + 4u) & 0x0FFFFFFFu;
         const std::uint32_t command = word >> 24u;
         const std::uint32_t data = word & 0x00FFFFFFu;
+        // Matrix data consumes cursors even if consecutive words are equal.
+        if (command >= 0x12u && (ge_commands[command] != data ||
+            (command >= 0x2Au && command <= 0x41u))) ++ge_state_revision;
         ge_commands[command] = data;
 
         if (command >= 0x2Au && command <= 0x3Fu)
@@ -95,11 +106,18 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
                               << " written=" << total_pixels_written << "\n";
             }
             return;
+        case 0xC4u:  // CLUTLOAD
+        case 0xCBu:  // TEXFLUSH
+        case 0xCCu:  // TEXSYNC
+#if defined(__ANDROID__)
+            android_gles_texture_barrier();
+#endif
+            break;
         case 0x04u: {
             GeRenderStats stats{};
             std::string error;
             if (!render_ge_primitive(memory, ge_commands, ge_transform, ge_vertex_address,
-                                     ge_index_address, data, stats, error, 1u, 0u, 0u, 0u,
+                                     ge_index_address, data, stats, error, 1u, ge_state_revision, ge_state_revision, ge_state_revision,
                                      diag)) {
                 if (diag)
                     std::cerr << "[ge-render] primitive failed at " << psprecomp::hex32(op_pc)

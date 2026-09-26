@@ -34,6 +34,9 @@ struct AndroidSound {
     std::uint64_t produced{};
     std::uint64_t dropped{};
     std::uint64_t resyncs{};
+    std::uint64_t starvation_rebases{};
+    std::atomic<std::uint64_t> mixed_samples{0};
+    std::atomic<std::uint64_t> invalidated_samples{0};
     bool anchored{};
     std::chrono::steady_clock::time_point last_log{};
 };
@@ -51,12 +54,14 @@ aaudio_data_callback_result_t android_audio_callback(
     for (int32_t base=0; base<count; base+=256) {
         const auto n=static_cast<std::size_t>(std::min<int32_t>(256,count-base));
         std::array<std::int32_t,512> mixed{};
-        std::uint64_t late=0, contributed=0;
+        std::uint64_t late=0, contributed=0, invalidated=0;
         for (auto &c:s.channels)
             contributed += c.queue.mix(std::span<std::int32_t>(mixed.data(),n*2),
                 first+static_cast<std::uint64_t>(base),
-                c.generation.load(std::memory_order_acquire),late);
+                c.generation.load(std::memory_order_acquire),late, &invalidated);
         s.late.fetch_add(late,std::memory_order_relaxed);
+        s.mixed_samples.fetch_add(contributed,std::memory_order_relaxed);
+        s.invalidated_samples.fetch_add(invalidated,std::memory_order_relaxed);
         if (!contributed) s.silent_frames.fetch_add(n,std::memory_order_relaxed);
         for (std::size_t i=0;i<n*2;i++)
             out[static_cast<std::size_t>(base)*2+i]=
@@ -74,7 +79,8 @@ void reset_audio_stopped(AndroidSound &s) {
         c.generation.fetch_add(1,std::memory_order_release);
     }
     s.clock.store(0); s.late.store(0); s.silent_frames.store(0);
-    s.anchored=false; s.produced=s.dropped=s.resyncs=0;
+    s.anchored=false; s.produced=s.dropped=s.resyncs=s.starvation_rebases=0;
+    s.mixed_samples.store(0); s.invalidated_samples.store(0);
 }
 bool open_android_audio(AndroidSound &s) {
     if (s.stream && s.error.load(std::memory_order_acquire)==0) return true;
@@ -131,17 +137,32 @@ void audio_output_submit(std::span<const std::int16_t> pcm,std::uint32_t frames,
     }
     auto &c=s.channels[channel];
     const auto gap=guest>c.expected_guest?guest-c.expected_guest:c.expected_guest-guest;
-    const bool changed=c.active && (c.rate!=rate || c.stereo!=stereo || gap>128);
-    const bool late=c.active && c.cursor<read+128;
-    if (!c.active || changed || late) {
-        if (c.active) ++s.resyncs;
-        c.generation.fetch_add(1,std::memory_order_release);
+    // Small guest-time gaps are scheduling jitter, not channel replacement.
+    // Changing generation here cancelled PCM before its playback lead elapsed.
+    const bool format_changed=c.active && (c.rate!=rate || c.stereo!=stereo);
+    const bool timeline_jump=c.active && gap>kAndroidRate/2;
+    if (!c.active) {
         const auto scheduled=guest>=s.guest_anchor
             ? s.host_anchor+guest-s.guest_anchor : read+kAndroidLead;
         c.cursor=std::max(scheduled,read+kAndroidLead);
         if (c.cursor>read+kAndroidRate) c.cursor=read+kAndroidLead;
         c.rate=rate; c.stereo=stereo; c.active=true;
         c.resampler.reset(rate,stereo);
+    } else {
+        if (format_changed || timeline_jump) {
+            // Queued PCM is already in output format. Preserve it and reset
+            // only interpolation history. Explicit channel reset still cancels.
+            ++s.resyncs;
+            c.resampler.reset(rate,stereo);
+            c.rate=rate; c.stereo=stereo;
+        }
+        constexpr std::uint64_t callback_safety=512;
+        if (c.cursor<read+callback_safety) {
+            // Recover a real underrun without cancelling pending packets or
+            // restarting another full 93ms silent prebuffer.
+            c.cursor=read+callback_safety;
+            ++s.starvation_rebases;
+        }
     }
     c.expected_guest=guest+(static_cast<std::uint64_t>(frames)*kAndroidRate+rate/2)/rate;
     TimedPcmQueue::Packet packet;
@@ -172,6 +193,9 @@ void audio_output_advance(std::uint64_t) {
     runtime_log_line("audio: produced="+std::to_string(s.produced)+
         " lateSamples="+std::to_string(s.late.load())+
         " dropped="+std::to_string(s.dropped)+" resyncs="+std::to_string(s.resyncs)+
+        " starvationRebases="+std::to_string(s.starvation_rebases)+
+        " mixedSamples="+std::to_string(s.mixed_samples.load())+
+        " invalidatedSamples="+std::to_string(s.invalidated_samples.load())+
         " silentCallbackFrames="+std::to_string(s.silent_frames.load())+
         " xruns="+std::to_string(AAudioStream_getXRunCount(s.stream)));
 }

@@ -589,6 +589,7 @@ void record_clip_vertex(GeRenderStats &stats, const Vertex &vertex) noexcept {
 }
 
 void record_screen_vertex(GeRenderStats &stats, const Vertex &vertex) noexcept {
+    if (!g_collect_ge_render_stats) return;
     if (!std::isfinite(vertex.x) || !std::isfinite(vertex.y)) return;
     ++stats.screen_vertices;
     const float max_abs = std::max(std::fabs(vertex.x), std::fabs(vertex.y));
@@ -1280,7 +1281,8 @@ bool decode_vertex(const psprecomp::GuestMemory &memory, std::uint32_t address,
                    const VertexLayout &layout,
                    const std::array<std::uint32_t, 256> &commands,
                    const GeTransformState &transform,
-                   Vertex &vertex, std::string &error) {
+                   Vertex &vertex, std::string &error,
+                   const PreparedLighting *prepared = nullptr) {
     if (!memory.contains(address, layout.stride)) {
         error = "GE vertex lies outside guest memory at " + psprecomp::hex32(address);
         return false;
@@ -1367,8 +1369,10 @@ bool decode_vertex(const psprecomp::GuestMemory &memory, std::uint32_t address,
         world_normal = transform_normal_4x3(transform.world, model_normal);
         if ((data24(commands[0x51u]) & 1u) != 0u) world_normal = world_normal * -1.0f;
         world_normal = normalized_or_001(world_normal);
-        vertex.color = apply_lighting(vertex.color, layout.color_type >= 4u, world_position,
-                                      world_normal, commands);
+        vertex.color = prepared
+            ? apply_prepared_lighting(vertex.color, world_position, world_normal, *prepared)
+            : apply_lighting(vertex.color, layout.color_type >= 4u, world_position,
+                             world_normal, commands);
     }
 
     const Vec3 view = transform_4x3(transform.view, world_position);
@@ -1478,12 +1482,13 @@ bool decode_vertex_optimized(const psprecomp::GuestMemory &memory, std::uint32_t
                              const VertexLayout &layout,
                              const std::array<std::uint32_t, 256> &commands,
                              const GeTransformState &transform,
-                             Vertex &vertex, std::string &error) {
+                             Vertex &vertex, std::string &error,
+                   const PreparedLighting *prepared = nullptr) {
     const std::uint32_t uv_mode = data24(commands[0xC0u]) & 3u;
     if (layout.type == 0x000115u && !layout.through &&
         (data24(commands[0x17u]) & 1u) == 0u && (uv_mode == 0u || uv_mode == 3u))
         return decode_vertex_0115_fast(memory, address, layout, commands, transform, vertex, error);
-    return decode_vertex(memory, address, layout, commands, transform, vertex, error);
+    return decode_vertex(memory, address, layout, commands, transform, vertex, error, prepared);
 }
 
 bool decode_model_vertex_0115_for_gpu_fast(
@@ -3305,6 +3310,21 @@ void append_prepared_triangles(const std::array<std::uint32_t, 256> &commands,
     }
 
     const bool depth_clip_enabled = (data24(commands[0x1Cu]) & 1u) != 0u;
+    // Preserve the original polygon clipper for boundary-crossing triangles.
+    const auto outcode = [&](const Vertex &v) {
+        unsigned bits = 0;
+        for (unsigned p = 0; p < (depth_clip_enabled ? 6u : 4u); ++p)
+            if (!(clip_distance(v, p) >= 0.0f)) bits |= 1u << p;
+        return bits;
+    };
+    const unsigned oa=outcode(a), ob=outcode(b), oc=outcode(c);
+    if ((oa & ob & oc) != 0u) return;
+    if ((oa | ob | oc) == 0u) {
+        Vertex va=a, vb=b, vc=c;
+        if (viewport_transform(va, commands) && viewport_transform(vb, commands) &&
+            viewport_transform(vc, commands)) emplace_prepared(va,vb,vc);
+        return;
+    }
     static thread_local ClipPolygon polygon;
     clip_triangle(a, b, c, depth_clip_enabled, polygon);
     if (polygon.size < 3u) return;
@@ -4573,6 +4593,8 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         std::array<std::uint32_t, 256> reuse_indices{};
         std::array<bool, 256> reuse_valid{};
         const bool reuse_indexed = gpu_backend_enabled && layout.index_type != 0u;
+        // Material/light state is identical for all vertices in this primitive.
+        const PreparedLighting primitive_lighting = prepare_lighting(layout.color_type >= 4u, commands);
         for (std::uint32_t i = 0u; i < count; ++i) {
             const std::uint32_t index = draw_indices(i);
             const auto slot = index & 255u;
@@ -4585,7 +4607,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             }
             Vertex vertex{};
             if (!decode_vertex_optimized(memory, vertex_address + index * layout.stride, layout,
-                                         commands, transform, vertex, error)) return false;
+                                         commands, transform, vertex, error, &primitive_lighting)) return false;
 #if defined(__ANDROID__)
             // SurfaceFlinger stretches the low-resolution producer buffer to the
             // physical ultrawide display. Compress 3D clip X by the inverse

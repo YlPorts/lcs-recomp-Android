@@ -11,6 +11,8 @@
 
 #if defined(__ANDROID__)
 #include "android_debug.hpp"
+#include "ge_renderer.hpp"
+#include "lcs_runtime_log.hpp"
 #endif
 
 #include "psprecomp/common.hpp"
@@ -2102,6 +2104,39 @@ void report_realtime_speed_if_requested(const psprecomp::Runtime &runtime, std::
     vblank_start = vblank_index;
 }
 
+#if defined(__ANDROID__)
+void android_pipeline_report() {
+    static auto started=std::chrono::steady_clock::now();
+    static GePhaseTotals previous{};
+    static std::uint64_t before_ge{}, before_gpu{}, before_wait{}, frames{};
+    ++frames;
+    const auto now=std::chrono::steady_clock::now();
+    const double elapsed_ms=std::chrono::duration<double,std::milli>(now-started).count();
+    if (elapsed_ms<2000.0) return;
+    const auto phase=ge_phase_totals();
+    const auto ge=g_speed_ge_list_ns.load(), gpu=g_speed_gpu_finish_ns.load(), wait=g_speed_throttle_ns.load();
+    const double denominator=1.0e6*static_cast<double>(frames);
+    const auto ms=[&](std::uint64_t after,std::uint64_t before) {
+        return after>=before ? (after-before)/denominator : 0.0;
+    };
+    const double ge_ms=ms(ge,before_ge),gpu_ms=ms(gpu,before_gpu),wait_ms=ms(wait,before_wait);
+    std::ostringstream report;
+    report<<std::fixed<<std::setprecision(3)
+        <<"pipeline: frameCalls="<<frames<<" wallMsPerCall="<<elapsed_ms/frames
+        <<" geTotalMs="<<ge_ms<<" submitMs="<<gpu_ms<<" waitMs="<<wait_ms
+        <<" otherMs="<<std::max(0.0,elapsed_ms/frames-ge_ms-gpu_ms-wait_ms)
+        <<" setupMs="<<ms(phase.draw_setup_ns,previous.draw_setup_ns)
+        <<" textureMs="<<ms(phase.texture_upload_ns,previous.texture_upload_ns)
+        <<" vertexMs="<<ms(phase.vertex_decode_ns,previous.vertex_decode_ns)
+        <<" clipMs="<<ms(phase.triangle_prep_ns,previous.triangle_prep_ns)
+        <<" batchMs="<<ms(phase.gpu_accumulate_ns,previous.gpu_accumulate_ns)
+        <<" prims="<<(phase.primitives-previous.primitives)
+        <<" vertices="<<(phase.vertices-previous.vertices);
+    runtime_log_line(report.str());
+    previous=phase;before_ge=ge;before_gpu=gpu;before_wait=wait;frames=0;started=now;
+}
+#endif
+
 void check_wall_clock_limit(psprecomp::Runtime &runtime, std::uint64_t sample_mask) {
     if (wall_clock_limit_seconds <= 0.0 || runtime.stopped()) return;
     static std::uint64_t wall_clock_samples = 0u;
@@ -3958,6 +3993,9 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         g_speed_throttle_ns += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - throttle_started).count());
         report_realtime_speed_if_requested(rt, display_vblank_index);
+#if defined(__ANDROID__)
+        android_pipeline_report();
+#endif
         static const bool fixed_delay = std::getenv("LCS_VBLANK_FIXED_DELAY") != nullptr;
         const std::uint32_t vblank_delay = fixed_delay
             ? static_cast<std::uint32_t>(kVblankPeriodUs)

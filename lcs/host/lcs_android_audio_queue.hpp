@@ -33,7 +33,8 @@ public:
         return true;
     }
     std::uint64_t mix(std::span<std::int32_t> out, std::uint64_t first,
-                      std::uint32_t generation, std::uint64_t &late) noexcept {
+                      std::uint32_t generation, std::uint64_t &late,
+                      std::uint64_t *invalidated = nullptr) noexcept {
         const auto frames = out.size() / 2;
         std::uint64_t contributed = 0;
         auto r = read_.load(std::memory_order_relaxed);
@@ -42,6 +43,8 @@ public:
             if (r == write_.load(std::memory_order_acquire)) break;
             const Packet &p = packets_[r % kPackets];
             if (p.generation != generation || offset_ >= p.frames) {
+                if (invalidated && p.generation != generation && p.frames > offset_)
+                    *invalidated += p.frames - offset_;
                 offset_ = 0;
                 read_.store(++r, std::memory_order_release);
                 continue;

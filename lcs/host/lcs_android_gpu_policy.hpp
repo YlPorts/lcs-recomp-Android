@@ -39,3 +39,8 @@ inline bool color_test_pass(unsigned function, std::uint32_t rgb,
     }
 }
 } // namespace lcs::android_detail
+
+namespace lcs {
+// Invalidate checks, not images pinned by pending primitives.
+void android_gles_texture_barrier() noexcept;
+}

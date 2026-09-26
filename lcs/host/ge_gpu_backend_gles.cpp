@@ -78,6 +78,12 @@ struct GlesState {
     std::thread::id gl_thread{};
     std::uint32_t scale{2u};
     std::uint64_t frame_epoch{1u};
+    std::uint64_t validation_epoch{1u};
+    std::unordered_map<std::uint32_t, GLuint> samplers;
+    std::array<std::uint32_t,16> pixel_uniform_key{};
+    bool pixel_uniform_valid{};
+    bool cpu_transform_uniform_valid{};
+    std::uint32_t uniform_width{}, uniform_height{};
     std::uint64_t perf_frame_ns{};
     std::uint64_t perf_frame_count{};
     std::chrono::steady_clock::time_point perf_window{};
@@ -259,6 +265,10 @@ void destroy_gl_objects(GlesState &s) noexcept {
     }
     s.textures.clear();
     s.texture_versions.clear();
+    for (auto [key, sampler] : s.samplers) { (void)key; glDeleteSamplers(1,&sampler); }
+    s.samplers.clear();
+    s.pixel_uniform_valid=false;
+    s.cpu_transform_uniform_valid=false;
     s.frame_vertices.clear();
     s.frame_indices.clear();
     s.texture_cache_bytes = 0u;
@@ -951,6 +961,10 @@ std::array<float, 4> add_scaled(const std::array<float, 4> &a, float sa,
 void set_transform_uniforms(
     GlesState &s, const GlesBatch &batch,
     std::uint32_t logical_width, std::uint32_t logical_height) {
+    if (!batch.hardware_transform && s.cpu_transform_uniform_valid &&
+        s.uniform_width==logical_width && s.uniform_height==logical_height) return;
+    s.cpu_transform_uniform_valid=!batch.hardware_transform;
+    s.uniform_width=logical_width; s.uniform_height=logical_height;
     glUniform2f(s.u_logical_size,
                 static_cast<float>(logical_width),
                 static_cast<float>(logical_height));
@@ -1006,6 +1020,16 @@ void set_transform_uniforms(
 
 void set_pixel_uniforms(GlesState &s, const GeGpuDrawDescriptor &draw,
                         bool textured) {
+    const bool flip=draw.texture_enabled && feedback_target(s, draw.texture_address)!=s.targets.end();
+    const std::array<std::uint32_t,16> key{{
+        textured, draw.texture_function & 7u, draw.texture_use_alpha,
+        draw.texture_double_color, draw.texture_env, draw.alpha_test_enabled,
+        draw.alpha_function & 7u, draw.alpha_reference & 255u, draw.alpha_mask & 255u,
+        draw.fog_enabled, draw.fog_color, draw.framebuffer_format & 3u,
+        draw.color_test_enabled && !draw.clear_mode ? (draw.color_test_function & 3u)+1u : 0u,
+        draw.color_test_reference, draw.color_test_mask, flip}};
+    if (s.pixel_uniform_valid && key==s.pixel_uniform_key) return;
+    s.pixel_uniform_key=key; s.pixel_uniform_valid=true;
     glUniform1i(s.u_tex, 0);
     glUniform1i(s.u_texture_flip_v,
         draw.texture_enabled && feedback_target(s, draw.texture_address) != s.targets.end());
@@ -1105,6 +1129,30 @@ void configure_texture_sampling(const GeGpuDrawDescriptor &draw, GLuint texture)
                     draw.texture_mag_linear ? GL_LINEAR : GL_NEAREST);
 }
 
+void bind_draw_sampler(GlesState &s, const GeGpuDrawDescriptor &draw, GLuint texture) {
+    const auto key=static_cast<std::uint32_t>(draw.texture_clamp_u) |
+        (static_cast<std::uint32_t>(draw.texture_clamp_v)<<1u) |
+        (static_cast<std::uint32_t>(draw.texture_min_linear)<<2u) |
+        (static_cast<std::uint32_t>(draw.texture_mag_linear)<<3u) |
+        (static_cast<std::uint32_t>(draw.texture_mipmap_enabled && draw.texture_max_level>0u)<<4u) |
+        (static_cast<std::uint32_t>(draw.texture_mipmap_linear)<<5u);
+    auto [it, inserted]=s.samplers.try_emplace(key,0u);
+    if (inserted) {
+        glGenSamplers(1,&it->second);
+        const GLuint id=it->second;
+        glSamplerParameteri(id,GL_TEXTURE_WRAP_S,draw.texture_clamp_u?GL_CLAMP_TO_EDGE:GL_REPEAT);
+        glSamplerParameteri(id,GL_TEXTURE_WRAP_T,draw.texture_clamp_v?GL_CLAMP_TO_EDGE:GL_REPEAT);
+        GLint filter=draw.texture_min_linear?GL_LINEAR:GL_NEAREST;
+        if ((key & 16u)!=0u) filter=draw.texture_mipmap_linear
+            ? (draw.texture_min_linear?GL_LINEAR_MIPMAP_LINEAR:GL_NEAREST_MIPMAP_LINEAR)
+            : (draw.texture_min_linear?GL_LINEAR_MIPMAP_NEAREST:GL_NEAREST_MIPMAP_NEAREST);
+        glSamplerParameteri(id,GL_TEXTURE_MIN_FILTER,filter);
+        glSamplerParameteri(id,GL_TEXTURE_MAG_FILTER,draw.texture_mag_linear?GL_LINEAR:GL_NEAREST);
+    }
+    glBindTexture(GL_TEXTURE_2D,texture);
+    glBindSampler(0,it->second);
+}
+
 bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
     GlesTarget &target = target_metadata(s, batch.draw.framebuffer_address);
     if (s.frame_epoch <= 12u) {
@@ -1168,7 +1216,7 @@ bool draw_batch(GlesState &s, GlesBatch &batch, std::string &error) {
     glActiveTexture(GL_TEXTURE0);
     const GLuint texture = texture_for_draw(s, batch.draw, &target);
     const bool textured = batch.draw.texture_enabled && texture != 0u;
-    if (textured) configure_texture_sampling(batch.draw, texture);
+    if (textured) bind_draw_sampler(s, batch.draw, texture);
     else glBindTexture(GL_TEXTURE_2D, 0u);
     set_pixel_uniforms(s, batch.draw, textured);
 
@@ -1232,6 +1280,7 @@ bool present_target(GlesState &s, GlesTarget &target, std::string &error) {
     glClear(GL_COLOR_BUFFER_BIT);
 
     glUseProgram(s.present_program);
+    glBindSampler(0,0);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, target.color);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -1306,6 +1355,10 @@ void destroy_backend(GlesState &s) noexcept {
 }
 
 }  // namespace
+
+void android_gles_texture_barrier() noexcept {
+    ++state().validation_epoch;
+}
 
 bool initialize_ge_gpu_backend(std::string &error) {
     GlesState &s = state();
@@ -1401,7 +1454,7 @@ void ge_gpu_backend_record_draw(const GeGpuDrawDescriptor &draw) noexcept {
     if (!s.enabled) return;
 
     if (draw.texture_enabled && draw.texture_content_signature != 0u)
-        s.texture_versions.observe(texture_key(draw), draw.texture_content_signature, s.frame_epoch);
+        s.texture_versions.observe(texture_key(draw), draw.texture_content_signature, s.validation_epoch);
 
     ++s.report.draw_calls;
     s.report.vertices += draw.vertex_count;
@@ -1476,7 +1529,7 @@ bool ge_gpu_backend_texture_signature_needed(const GeGpuDrawDescriptor &draw) no
     if (!s.enabled || !draw.texture_enabled || !draw.texture_width || !draw.texture_height)
         return false;
     if (feedback_target(s, draw.texture_address) != s.targets.end()) return false;
-    return s.texture_versions.needs_check(texture_key(draw), s.frame_epoch);
+    return s.texture_versions.needs_check(texture_key(draw), s.validation_epoch);
 }
 
 bool ge_gpu_backend_is_framebuffer_feedback_texture(
@@ -1981,6 +2034,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     // can be evicted safely if the configured memory/entry budget was exceeded.
     trim_texture_cache(s, true);
     ++s.frame_epoch;
+    ++s.validation_epoch;
     return presented;
 }
 

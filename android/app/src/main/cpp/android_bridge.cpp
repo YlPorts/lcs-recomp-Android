@@ -176,6 +176,9 @@ Java_com_ylports_lcsrecomp_MainActivity_nativeRun(
     // renderer on the native game thread; rasterization still happens on the
     // GPU, so this does NOT restore the old CPU pixel bottleneck.
     setenv("LCS_GE_ASYNC", "0", 1);
+    // Present the complete batch at guest vblank, not intermediate GE lists.
+    setenv("LCS_GE_NO_FRAME_SPLIT", "1", 1);
+    setenv("PSPRECOMP_GE_PHASE_DIAG", "1", 1);
 
     // Mobile software-raster tuning for the 2+6 core layout common on midrange
     // ARM phones. Six row workers plus the GE/game threads keeps all cores busy
