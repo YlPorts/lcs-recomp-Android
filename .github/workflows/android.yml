@@ -32,8 +32,8 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Apply checked 0.6.13 source update
-        run: python3 android/tools/repair_0613.py
+      - name: Apply checked 0.6.14 source update
+        run: python3 android/tools/repair_0614.py
       - name: Component and audio regression tests
         run: |
           mkdir -p android/test-results
@@ -90,6 +90,30 @@ jobs:
           g++ -std=c++20 -O2 -ffunction-sections -fdata-sections -Iinclude -Ilcs/host '-DLCS_TEST_RENDERER="/tmp/ge-renderer-before.cpp"' android/tests/texture_state_0613.cpp src/guest_memory.cpp -Wl,--gc-sections -pthread -o /tmp/texture-before
           if /tmp/texture-before > android/test-results/mip-palette-before.txt; then echo "Old mip reader unexpectedly passed"; exit 1; fi
           if /tmp/texture-before hash > android/test-results/texture-hash-before.txt; then echo "Old sampled hash unexpectedly passed"; exit 1; fi
+      - name: Effects continuity and GE control-flow regressions
+        run: |
+          set -euo pipefail
+          for mode in optimized sanitized; do
+            FLAGS="-std=c++20 -O2 -ffunction-sections -fdata-sections -Iinclude -Ilcs/host"
+            SAN=""
+            if [ "$mode" = sanitized ]; then FLAGS="-std=c++20 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -ffunction-sections -fdata-sections -Iinclude -Ilcs/host"; SAN="-fsanitize=address,undefined -fno-omit-frame-pointer"; fi
+            g++ $FLAGS -Drender_ge_primitive=test_capture_primitive -Dflush_ge_deferred_rasterization=test_flush -c lcs/host/lcs_ge_exec.cpp -o /tmp/ge-control-$mode.o
+            g++ $FLAGS android/tests/ge_control_regression.cpp src/guest_memory.cpp /tmp/ge-control-$mode.o -Wl,--gc-sections -pthread -o /tmp/ge-control-$mode
+            /tmp/ge-control-$mode | tee android/test-results/ge-control-$mode.txt
+            g++ -std=c++20 -O1 -g $SAN -D__ANDROID__ -pthread -Iandroid/tests/shim -Ilcs/host android/tests/audio_deadline_regression.cpp -o /tmp/audio-deadline-$mode
+            /tmp/audio-deadline-$mode | tee android/test-results/audio-deadline-$mode.txt
+          done
+          git show fffaaf08624128ad22c9303b1024d736975e9615:lcs/host/lcs_ge_exec.cpp > /tmp/ge-control-before.cpp
+          FLAGS="-std=c++20 -O2 -ffunction-sections -fdata-sections -Iinclude -Ilcs/host"
+          g++ $FLAGS -Drender_ge_primitive=test_capture_primitive -Dflush_ge_deferred_rasterization=test_flush -c /tmp/ge-control-before.cpp -o /tmp/ge-control-before.o
+          g++ $FLAGS android/tests/ge_control_regression.cpp src/guest_memory.cpp /tmp/ge-control-before.o -Wl,--gc-sections -pthread -o /tmp/ge-control-before
+          for mode in call bbox; do
+            if /tmp/ge-control-before $mode > android/test-results/ge-control-before-$mode.txt 2>&1; then echo "Old control flow unexpectedly passed"; exit 1; fi
+          done
+          mkdir -p /tmp/audio-before
+          for name in lcs_audio_output.cpp lcs_audio_output_android.inc; do git show fffaaf08624128ad22c9303b1024d736975e9615:lcs/host/$name > /tmp/audio-before/$name; done
+          g++ -std=c++20 -O2 -D__ANDROID__ -pthread -Iandroid/tests/shim -I/tmp/audio-before -Ilcs/host android/tests/audio_deadline_regression.cpp -o /tmp/audio-deadline-before
+          if /tmp/audio-deadline-before > android/test-results/audio-deadline-before.txt 2>&1; then echo "Old audio unexpectedly passed"; exit 1; fi
       - name: Install graphics test dependencies
         run: |
           sudo apt-get update -qq
@@ -101,6 +125,16 @@ jobs:
           /tmp/gles-backend | tee android/test-results/gles-backend-fetch.txt
           PSPRECOMP_GLES_FB_FETCH=0 /tmp/gles-backend | tee android/test-results/gles-backend-copy.txt
           python3 android/tests/gles_smoke.py | tee android/test-results/shader-readback.txt
+      - name: Actual shared depth and CPU batch recycling regressions
+        run: |
+          set -euo pipefail
+          FLAGS="-std=c++20 -O2 -D__ANDROID__ -Iandroid/tests/shim -Iandroid/app/src/main/cpp -Ilcs/host"
+          g++ $FLAGS android/tests/gles_depth_regression.cpp lcs/host/lcs_android_build.cpp -pthread -lEGL -lGLESv2 -o /tmp/gles-depth
+          /tmp/gles-depth | tee android/test-results/gles-depth-fetch.txt
+          PSPRECOMP_GLES_FB_FETCH=0 /tmp/gles-depth | tee android/test-results/gles-depth-copy.txt
+          git show fffaaf08624128ad22c9303b1024d736975e9615:lcs/host/ge_gpu_backend_gles.cpp > /tmp/gles-depth-before.cpp
+          g++ $FLAGS -DLCS_BASELINE_TEST '-DLCS_GLES_SOURCE="/tmp/gles-depth-before.cpp"' android/tests/gles_depth_regression.cpp lcs/host/lcs_android_build.cpp -pthread -lEGL -lGLESv2 -o /tmp/gles-depth-before
+          if /tmp/gles-depth-before > android/test-results/gles-depth-before.txt 2>&1; then echo "Old depth state unexpectedly passed"; exit 1; fi
       - name: Validate shader sources
         run: |
           python3 - <<'PY'
@@ -129,24 +163,25 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -u
+          git add android/tests/ge_control_regression.cpp android/tests/audio_deadline_regression.cpp android/tests/gles_depth_regression.cpp android/REPAIR_0614.md
           git add lcs/host/lcs_ge_state_policy.hpp android/tests/texture_state_0613.cpp android/tests/vertex_state_0613.cpp
           git add android/tools/repair_0613.patch lcs/host/lcs_ge_vertex_memo.hpp lcs/host/lcs_ge_triangle_indices.hpp android/tests/ge_command_state_regression.cpp android/tests/vertex_memo_regression.cpp android/tests/scale_config_regression.py
           git add lcs/host/lcs_android_build.cpp lcs/host/lcs_android_build.hpp android/REPAIR_0613.md android/tests/lighting_cache_regression.cpp android/tests/reference_fragments.cpp android/tests/verify_apk.py
           if ! git diff --cached --quiet; then
-            git commit -m "Apply tested Android 0.6.13 mip palette/LOD, bounded geometry buffers and exact state reuse [skip ci]"
+            git commit -m "Apply verified Android 0.6.14 control flow, shared depth and effects continuity fixes [skip ci]"
             git push origin HEAD:android-port
           fi
       - name: Record exact source
         run: |
           git rev-parse HEAD > android/test-results/source-commit.txt
-          git archive --format=tar.gz -o /tmp/LCSRecomp-Android-0.6.13-source.tar.gz HEAD
+          git archive --format=tar.gz -o /tmp/LCSRecomp-Android-0.6.14-source.tar.gz HEAD
           git -C android/.deps/ffmpeg-source archive --prefix=FFmpeg-7.1.5/ --format=tar.gz -o /tmp/LCS-FFmpeg-7.1.5-source.tar.gz HEAD
       - name: Upload source and tests
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.13-source-and-tests
+          name: LCSRecomp-Android-0.6.14-source-and-tests
           path: |
-            /tmp/LCSRecomp-Android-0.6.13-source.tar.gz
+            /tmp/LCSRecomp-Android-0.6.14-source.tar.gz
             /tmp/LCS-FFmpeg-7.1.5-source.tar.gz
             android/test-results/
       - name: Java 17
@@ -208,7 +243,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.13-arm64-debug
+          name: LCSRecomp-Android-0.6.14-arm64-debug
           path: |
             android/app/build/outputs/apk/debug/app-debug.apk
             android/app/build/outputs/apk/debug/app-debug.apk.sha256
@@ -218,5 +253,5 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.13-failed-test-results
+          name: LCSRecomp-Android-0.6.14-failed-test-results
           path: android/test-results/
