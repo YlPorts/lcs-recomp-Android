@@ -1,6 +1,8 @@
 // Replay the actual CPU vertex stage from capture_vertex_fixture.py inputs.
 // Build with LCS_BASELINE_REPLAY and LCS_TEST_RENDERER pointing at an unmodified
 // renderer to write a reference. No captured game data belongs in the repo.
+// For 0.6.18 use LCS_BASELINE_MEMO_REPLAY instead: retain its ambient decoder,
+// but select its generic memo API. See evidence_0619_cpu.md for exact commands.
 #ifndef LCS_TEST_RENDERER
 #define LCS_TEST_RENDERER "../../lcs/host/ge_renderer.cpp"
 #endif
@@ -136,7 +138,13 @@ static ReplayResult replay(const std::vector<CapturedDraw> &draws, Observe obser
                         &lighting,&light_cache,environment_uv ? &environment:nullptr);
                 };
                 bool hit=false;
-                const bool ok=memo_enabled ? memo.decode(record,layout.stride,vertex,hit,decode):decode(vertex);
+                bool ok;
+#if !defined(LCS_BASELINE_REPLAY) && !defined(LCS_BASELINE_MEMO_REPLAY)
+                if (memo_enabled && ambient_0115)
+                    ok=memo.decode<10u>(record,layout.stride,vertex,hit,decode);
+                else
+#endif
+                    ok=memo_enabled ? memo.decode(record,layout.stride,vertex,hit,decode):decode(vertex);
                 if (!ok) throw std::runtime_error(error);
                 result.memo_hits+=hit;
                 if (layout.index_type) {

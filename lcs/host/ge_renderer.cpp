@@ -4960,7 +4960,10 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             };
             bool memo_hit=false;
             if (memo_enabled) {
-                if (!primitive_vertex_cache.decode(record,layout.stride,vertex,memo_hit,decode)) return false;
+                const bool decoded=ambient_0115
+                    ? primitive_vertex_cache.decode<10u>(record,layout.stride,vertex,memo_hit,decode)
+                    : primitive_vertex_cache.decode(record,layout.stride,vertex,memo_hit,decode);
+                if (!decoded) return false;
                 if (memo_hit) ++g_ge_memo_hits;
             } else if (!decode(vertex)) return false;
 #if defined(__ANDROID__)
@@ -5130,13 +5133,13 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             viewport.cull_enabled = (data24(commands[0x1Du]) & 1u) != 0u;
             viewport.accept_counter_clockwise = (data24(commands[0x9Bu]) & 1u) != 0u;
             viewport.flat_shading = (data24(commands[0x50u]) & 1u) == 0u;
-            static thread_local std::vector<GeGpuVertex> clip_vertices;
+            static thread_local std::vector<GeGpuClipVertex> clip_vertices;
             clip_vertices.clear(); clip_vertices.reserve(vertices.size());
             bool finite = true;
             for (const auto &v : vertices) {
                 finite &= finite_float(v.x) && finite_float(v.y) && finite_float(v.z) && finite_float(v.w);
                 if (!depth_clip) finite &= v.w>0.0f && v.z>=-v.w && v.z<=v.w;
-                GeGpuVertex out{};
+                GeGpuClipVertex out{};
                 out.x=v.x;out.y=v.y;out.z=v.z;out.w=v.w;
                 out.rgba=pack_gpu_color(v.color);out.u=v.u;out.v=v.v;
                 out.fog_factor=v.fog_factor;out.q=v.q;

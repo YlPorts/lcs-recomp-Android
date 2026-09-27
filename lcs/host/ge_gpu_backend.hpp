@@ -157,6 +157,19 @@ struct GeGpuVertex {
 
 
 #if defined(__ANDROID__)
+// Attributes consumed by GLES. Keep positions/UV/fog at full float precision;
+// desktop-only control words are already carried as Android draw uniforms.
+struct GeGpuClipVertex {
+    float x{}, y{}, z{}, w{1.0f};
+    std::uint32_t rgba{0xFFFFFFFFu};
+    float u{}, v{}, fog_factor{1.0f}, q{1.0f};
+    GeGpuClipVertex() = default;
+    GeGpuClipVertex(const GeGpuVertex &v) noexcept
+        : x(v.x), y(v.y), z(v.z), w(v.w), rgba(v.rgba),
+          u(v.u), v(v.v), fog_factor(v.fog_factor), q(v.q) {}
+};
+static_assert(sizeof(GeGpuClipVertex) == 36u);
+
 struct GeGpuClipViewport {
     std::int32_t x{}, y{}, width{}, height{}; // PSP top-left pixel coordinates
     float near_depth{}, far_depth{};
@@ -188,6 +201,8 @@ inline bool build_ge_gpu_clip_viewport(float sx,float sy,float sz,
 // Returns false without consuming the draw if this optional GLES path is off.
 bool ge_gpu_backend_accumulate_clip_vertices(const GeGpuDrawDescriptor &,
     const GeGpuClipViewport &,std::span<const GeGpuVertex>) noexcept;
+bool ge_gpu_backend_accumulate_clip_vertices(const GeGpuDrawDescriptor &,
+    const GeGpuClipViewport &,std::span<const GeGpuClipVertex>) noexcept;
 #endif
 
 struct GeGpuDecodedMipLevel {

@@ -42,17 +42,7 @@ namespace {
 constexpr std::uint32_t kReferenceWidth = 480u;
 constexpr std::uint32_t kReferenceHeight = 272u;
 
-// Only GLES-consumed attributes. Do not upload desktop control words that are
-// already per-draw uniforms. All positions/UV/fog retain full float precision.
-struct GlesStreamVertex {
-    float x,y,z,w;
-    std::uint32_t rgba;
-    float u,v,fog_factor,q;
-    explicit GlesStreamVertex(const GeGpuVertex &v) noexcept
-        : x(v.x),y(v.y),z(v.z),w(v.w),rgba(v.rgba),u(v.u),v(v.v),
-          fog_factor(v.fog_factor),q(v.q) {}
-};
-static_assert(sizeof(GlesStreamVertex)==36);
+using GlesStreamVertex = GeGpuClipVertex;
 struct GlesGeometrySlot {
     GLuint vertices{},indices{};
     std::size_t vertex_capacity{},index_capacity{};
@@ -128,7 +118,7 @@ struct GlesFeedbackSnapshot {
 };
 struct GlesBatch {
     GeGpuDrawDescriptor draw{};
-    std::vector<GeGpuVertex> vertices;
+    std::vector<GlesStreamVertex> vertices;
     std::vector<std::uint32_t> indices;
     std::uint32_t first_vertex{};
     std::uint32_t first_index{};
@@ -1065,7 +1055,7 @@ GlesBatch take_batch(GlesState &s) {
     GlesBatch out{};
     if (s.batch_pool.empty()) return out;
     auto &old=s.batch_pool.back();
-    s.batch_pool_bytes-=old.vertices.capacity()*sizeof(GeGpuVertex)+old.indices.capacity()*sizeof(std::uint32_t);
+    s.batch_pool_bytes-=old.vertices.capacity()*sizeof(GlesStreamVertex)+old.indices.capacity()*sizeof(std::uint32_t);
     out.vertices.swap(old.vertices);out.indices.swap(old.indices);
     out.vertices.clear();out.indices.clear();s.batch_pool.pop_back();++s.batch_reuses;
     return out;
@@ -1073,7 +1063,7 @@ GlesBatch take_batch(GlesState &s) {
 void recycle_batches(GlesState &s) {
     constexpr std::size_t limit=16u*1024u*1024u;
     for (auto &b:s.batches) {
-        const auto size=b.vertices.capacity()*sizeof(GeGpuVertex)+b.indices.capacity()*sizeof(std::uint32_t);
+        const auto size=b.vertices.capacity()*sizeof(GlesStreamVertex)+b.indices.capacity()*sizeof(std::uint32_t);
         if (size && size<=limit && s.batch_pool_bytes<=limit-size && s.batch_pool.size()<2048u) {
             try {
                 GlesBatch spare{};spare.vertices.swap(b.vertices);spare.indices.swap(b.indices);
@@ -1379,43 +1369,42 @@ void set_pixel_uniforms(GlesState &s, const GeGpuDrawDescriptor &draw,
         draw.texture_mipmap_enabled ? draw.texture_max_level : 0u,
         std::bit_cast<std::uint32_t>(feedback_x),std::bit_cast<std::uint32_t>(feedback_y)}};
     if (s.pixel_uniform_valid && key==s.pixel_uniform_key) return;
-    s.pixel_uniform_key=key; s.pixel_uniform_valid=true;
-    glUniform1i(s.u_tex, 0);
-    glUniform2f(s.u_feedback_scale,feedback_x,feedback_y);
-    const bool mips=draw.texture_mipmap_enabled;
-    glUniform1i(s.u_texture_lod_mode,!mips || draw.texture_level_mode==1u ? 1 : 0);
-    glUniform1f(s.u_texture_lod_bias,mips ? float(draw.texture_level_offset16)/16.0f : 0.0f);
-    glUniform1f(s.u_texture_max_lod,mips ? float(draw.texture_max_level) : 0.0f);
-    glUniform1i(s.u_texture_flip_v,
-        draw.texture_enabled && feedback_target(s, draw.texture_address) != s.targets.end());
-    glUniform1i(s.u_color_test, draw.color_test_enabled && !draw.clear_mode
-        ? static_cast<GLint>(draw.color_test_function & 3u) : -1);
+    // A material often changes only one field. Preserve program-local values
+    // and update exactly the affected uniforms instead of resending every one.
+    const auto changed = [&](std::size_t i) {
+        return !s.pixel_uniform_valid || key[i] != s.pixel_uniform_key[i];
+    };
+    if (!s.pixel_uniform_valid) glUniform1i(s.u_tex, 0);
+    if (changed(19) || changed(20)) glUniform2f(s.u_feedback_scale,feedback_x,feedback_y);
+    if (changed(16)) glUniform1i(s.u_texture_lod_mode,key[16]==1u ? 1 : 0);
+    if (changed(17)) glUniform1f(s.u_texture_lod_bias,
+        draw.texture_mipmap_enabled ? float(draw.texture_level_offset16)/16.0f : 0.0f);
+    if (changed(18)) glUniform1f(s.u_texture_max_lod,float(key[18]));
+    if (changed(15)) glUniform1i(s.u_texture_flip_v,flip);
+    if (changed(12)) glUniform1i(s.u_color_test,static_cast<GLint>(key[12])-1);
     const auto rgb_uniform = [](GLint location, std::uint32_t packed) {
         glUniform3i(location, packed & 255u, (packed >> 8u) & 255u, (packed >> 16u) & 255u);
     };
-    rgb_uniform(s.u_color_reference, draw.color_test_reference);
-    rgb_uniform(s.u_color_mask, draw.color_test_mask);
-    glUniform1i(s.u_texture_enabled, textured ? 1 : 0);
-    glUniform1i(s.u_texture_function, static_cast<GLint>(draw.texture_function & 7u));
-    glUniform1i(s.u_texture_use_alpha, draw.texture_use_alpha ? 1 : 0);
-    glUniform1i(s.u_texture_double, draw.texture_double_color ? 1 : 0);
-    glUniform3f(s.u_texture_env,
-                static_cast<float>(draw.texture_env & 0xFFu) / 255.0f,
-                static_cast<float>((draw.texture_env >> 8u) & 0xFFu) / 255.0f,
-                static_cast<float>((draw.texture_env >> 16u) & 0xFFu) / 255.0f);
-
-    glUniform1i(s.u_alpha_enabled, draw.alpha_test_enabled ? 1 : 0);
-    glUniform1i(s.u_alpha_func, static_cast<GLint>(draw.alpha_function & 7u));
-    glUniform1i(s.u_alpha_ref, static_cast<GLint>(draw.alpha_reference & 0xFFu));
-    glUniform1i(s.u_alpha_mask, static_cast<GLint>(draw.alpha_mask & 0xFFu));
-
-    glUniform1i(s.u_fog_enabled, draw.fog_enabled ? 1 : 0);
-    glUniform3f(s.u_fog_color,
-                static_cast<float>(draw.fog_color & 0xFFu) / 255.0f,
-                static_cast<float>((draw.fog_color >> 8u) & 0xFFu) / 255.0f,
-                static_cast<float>((draw.fog_color >> 16u) & 0xFFu) / 255.0f);
-    glUniform1i(s.u_framebuffer_format,
-                static_cast<GLint>(draw.framebuffer_format & 3u));
+    if (changed(13)) rgb_uniform(s.u_color_reference,draw.color_test_reference);
+    if (changed(14)) rgb_uniform(s.u_color_mask,draw.color_test_mask);
+    if (changed(0)) glUniform1i(s.u_texture_enabled,textured ? 1 : 0);
+    if (changed(1)) glUniform1i(s.u_texture_function,static_cast<GLint>(key[1]));
+    if (changed(2)) glUniform1i(s.u_texture_use_alpha,draw.texture_use_alpha ? 1 : 0);
+    if (changed(3)) glUniform1i(s.u_texture_double,draw.texture_double_color ? 1 : 0);
+    const auto rgb_float = [](GLint location, std::uint32_t packed) {
+        glUniform3f(location,(packed & 255u)/255.0f,
+            ((packed>>8u) & 255u)/255.0f,((packed>>16u) & 255u)/255.0f);
+    };
+    if (changed(4)) rgb_float(s.u_texture_env,draw.texture_env);
+    if (changed(5)) glUniform1i(s.u_alpha_enabled,draw.alpha_test_enabled ? 1 : 0);
+    if (changed(6)) glUniform1i(s.u_alpha_func,static_cast<GLint>(key[6]));
+    if (changed(7)) glUniform1i(s.u_alpha_ref,static_cast<GLint>(key[7]));
+    if (changed(8)) glUniform1i(s.u_alpha_mask,static_cast<GLint>(key[8]));
+    if (changed(9)) glUniform1i(s.u_fog_enabled,draw.fog_enabled ? 1 : 0);
+    if (changed(10)) rgb_float(s.u_fog_color,draw.fog_color);
+    if (changed(11)) glUniform1i(s.u_framebuffer_format,static_cast<GLint>(key[11]));
+    s.pixel_uniform_key=key;
+    s.pixel_uniform_valid=true;
 }
 
 GLuint texture_for_draw(GlesState &s, const GeGpuDrawDescriptor &draw,
@@ -2355,8 +2344,9 @@ bool gles_draw_state_compatible(
 }
 
 
-bool ge_gpu_backend_accumulate_clip_vertices(const GeGpuDrawDescriptor &input_draw,
-    const GeGpuClipViewport &viewport, std::span<const GeGpuVertex> vertices) noexcept {
+template <typename Vertex>
+bool accumulate_clip_vertices(const GeGpuDrawDescriptor &input_draw,
+    const GeGpuClipViewport &viewport, std::span<const Vertex> vertices) noexcept {
     auto &s=state();
     const char *setting=std::getenv("PSPRECOMP_GLES_CLIP");
     if (!s.enabled || (setting && std::strcmp(setting,"0")==0) || vertices.empty()) return false;
@@ -2394,11 +2384,13 @@ bool ge_gpu_backend_accumulate_clip_vertices(const GeGpuDrawDescriptor &input_dr
         };
         reserve_growing(destination->vertices,static_cast<std::size_t>(base)+count);
         reserve_growing(destination->indices,destination->indices.size()+indices);
-        destination->vertices.insert(destination->vertices.end(),vertices.begin(),vertices.end());
         const float iw=draw.texture_enabled && draw.texture_width ? 1.0f/draw.texture_width : 1.0f;
         const float ih=draw.texture_enabled && draw.texture_height ? 1.0f/draw.texture_height : 1.0f;
-        for (std::size_t i=base;i<destination->vertices.size();++i) {
-            destination->vertices[i].u*=iw;destination->vertices[i].v*=ih;
+        // Pack only consumed attributes and normalize UV in the same pass.
+        for (const auto &vertex : vertices) {
+            GlesStreamVertex packed(vertex);
+            packed.u*=iw;packed.v*=ih;
+            destination->vertices.push_back(packed);
         }
         append_ge_triangle_indices(destination->indices,primitive,count,base);
         if (destination==&fresh) {
@@ -2407,6 +2399,16 @@ bool ge_gpu_backend_accumulate_clip_vertices(const GeGpuDrawDescriptor &input_dr
         } else ++s.merged_clip_batches;
         return true;
     } catch (...) { return false; }
+}
+
+bool ge_gpu_backend_accumulate_clip_vertices(const GeGpuDrawDescriptor &draw,
+    const GeGpuClipViewport &viewport, std::span<const GeGpuVertex> vertices) noexcept {
+    return accumulate_clip_vertices(draw, viewport, vertices);
+}
+
+bool ge_gpu_backend_accumulate_clip_vertices(const GeGpuDrawDescriptor &draw,
+    const GeGpuClipViewport &viewport, std::span<const GeGpuClipVertex> vertices) noexcept {
+    return accumulate_clip_vertices(draw, viewport, vertices);
 }
 
 bool append_or_merge_color_batch(
@@ -2423,14 +2425,14 @@ bool append_or_merge_color_batch(
     const float inv_height = normalize_uv
         ? 1.0f / static_cast<float>(draw.texture_height) : 1.0f;
 
-    const auto append_vertices = [&](std::vector<GeGpuVertex> &destination) {
-        const std::size_t first = destination.size();
-        destination.insert(destination.end(), vertices.begin(), vertices.end());
-        if (normalize_uv) {
-            for (std::size_t i = first; i < destination.size(); ++i) {
-                destination[i].u *= inv_width;
-                destination[i].v *= inv_height;
-            }
+    const auto append_vertices = [&](std::vector<GlesStreamVertex> &destination) {
+        const auto required=destination.size()+vertices.size();
+        if (required>destination.capacity())
+            destination.reserve(std::max(required,destination.capacity()*2u));
+        for (const auto &vertex : vertices) {
+            GlesStreamVertex packed(vertex);
+            if (normalize_uv) { packed.u*=inv_width;packed.v*=inv_height; }
+            destination.push_back(packed);
         }
     };
 
@@ -2601,9 +2603,8 @@ void capture_gpu_frame(GlesState &s) noexcept {
         for(std::size_t i=0;i<s.batches.size();++i){
             const auto &batch=s.batches[i];const auto &draw=batch.draw;
             const auto prefix="gpu/batch_"+std::to_string(i);
-            std::vector<GlesStreamVertex>vertices;vertices.reserve(batch.vertices.size());
-            for(const auto &v:batch.vertices)vertices.emplace_back(v);
-            render_capture_bytes(prefix+".vertices",std::as_bytes(std::span(vertices)));
+            // The capture format remains the same 36-byte GLES vertex layout.
+            render_capture_bytes(prefix+".vertices",std::as_bytes(std::span(batch.vertices)));
             render_capture_bytes(prefix+".indices",std::as_bytes(std::span(batch.indices)));
             const auto key=draw.texture_enabled?texture_lookup_key(draw):0u;
             std::string metadata="{\"textureKey\":\""+std::to_string(key)+"\"";
@@ -2724,7 +2725,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
         for (GlesBatch &batch : s.batches) {
             batch.first_vertex = static_cast<std::uint32_t>(s.frame_vertices.size());
             batch.first_index = static_cast<std::uint32_t>(s.frame_indices.size());
-            for (const auto &v:batch.vertices) s.frame_vertices.emplace_back(v);
+            s.frame_vertices.insert(s.frame_vertices.end(),batch.vertices.begin(),batch.vertices.end());
 
             if (!batch.indices.empty()) {
                 for (std::uint32_t index : batch.indices)

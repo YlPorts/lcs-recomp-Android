@@ -24,8 +24,16 @@ public:
             generation_=1;
         }
     }
-    template<class Decode> bool decode(const std::uint8_t *record, std::uint32_t size,
+    template<std::uint32_t FixedSize=0u,class Decode> bool decode(const std::uint8_t *record, std::uint32_t record_size,
                                       Vertex &out, bool &hit, Decode &&decode) {
+        static_assert(FixedSize<=64u);
+        // Known layouts let the compiler unroll the exact same byte hash,
+        // comparison and copy. A mismatched size keeps the checked fallback.
+        if constexpr (FixedSize!=0u) {
+            if (record_size!=FixedSize)
+                return this->decode<0u>(record,record_size,out,hit,decode);
+        }
+        const std::uint32_t size=FixedSize ? FixedSize : record_size;
         hit=false;
         if (!record || size==0 || size>64) return decode(out);
         std::uint64_t hash=0x9E3779B97F4A7C15ull;

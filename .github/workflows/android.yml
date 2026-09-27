@@ -32,7 +32,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Verify direct 0.6.18 source
+      - name: Verify direct 0.6.19 source
         run: |
           python3 android/tests/scale_config_regression.py
           python3 android/tests/capture_ui_contract.py
@@ -66,6 +66,14 @@ jobs:
           /tmp/ambient-vertex | tee android/test-results/ambient-vertex.txt
           g++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -ffunction-sections -fdata-sections -Iinclude -Ilcs/host android/tests/ambient_vertex_regression.cpp src/guest_memory.cpp -Wl,--gc-sections -pthread -o /tmp/ambient-vertex-san
           /tmp/ambient-vertex-san | tee android/test-results/ambient-vertex-sanitized.txt
+      - name: Fixed-size vertex memo regression
+        run: |
+          set -euo pipefail
+          FLAGS="-std=c++20 -O3 -ffp-contract=fast -ffunction-sections -fdata-sections -Iinclude -Ilcs/host"
+          g++ $FLAGS android/tests/vertex_memo_0115_regression.cpp src/guest_memory.cpp -Wl,--gc-sections -pthread -o /tmp/vertex-memo-0115
+          /tmp/vertex-memo-0115 | tee android/test-results/vertex-memo-0115.txt
+          g++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -ffunction-sections -fdata-sections -Iinclude -Ilcs/host android/tests/vertex_memo_0115_regression.cpp src/guest_memory.cpp -Wl,--gc-sections -pthread -o /tmp/vertex-memo-0115-san
+          /tmp/vertex-memo-0115-san | tee android/test-results/vertex-memo-0115-sanitized.txt
       - name: GE command state and record reuse regressions
         run: |
           set -euo pipefail
@@ -211,6 +219,13 @@ jobs:
           set -euo pipefail
           g++ -std=c++20 -O2 -D__ANDROID__ -Iandroid/tests/shim -Iandroid/app/src/main/cpp -Ilcs/host -Iinclude android/tests/gles_surface_texture_regression.cpp lcs/host/lcs_android_build.cpp lcs/host/lcs_render_capture.cpp -pthread -lEGL -lGLESv2 -o /tmp/gles-surface-texture
           /tmp/gles-surface-texture | tee android/test-results/surface-texture-recovery.txt
+      - name: Compact geometry and incremental uniform regressions
+        run: |
+          set -euo pipefail
+          FLAGS="-std=c++20 -O2 -D__ANDROID__ -Iandroid/tests/shim -Iandroid/app/src/main/cpp -Ilcs/host -Iinclude"
+          g++ $FLAGS android/tests/gles_submission_regression.cpp lcs/host/lcs_android_build.cpp lcs/host/lcs_render_capture.cpp -pthread -lEGL -lGLESv2 -o /tmp/gles-submission
+          /tmp/gles-submission | tee android/test-results/gles-submission-fetch.txt
+          PSPRECOMP_GLES_FB_FETCH=0 /tmp/gles-submission | tee android/test-results/gles-submission-copy.txt
       - name: Validate shader sources
         run: |
           python3 - <<'PY'
@@ -236,14 +251,14 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD > android/test-results/source-commit.txt
-          git archive --format=tar.gz -o /tmp/LCSRecomp-Android-0.6.18-source.tar.gz HEAD
+          git archive --format=tar.gz -o /tmp/LCSRecomp-Android-0.6.19-source.tar.gz HEAD
           git -C android/.deps/ffmpeg-source archive --prefix=FFmpeg-7.1.5/ --format=tar.gz -o /tmp/LCS-FFmpeg-7.1.5-source.tar.gz HEAD
       - name: Upload source and tests
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.18-source-and-tests
+          name: LCSRecomp-Android-0.6.19-source-and-tests
           path: |
-            /tmp/LCSRecomp-Android-0.6.18-source.tar.gz
+            /tmp/LCSRecomp-Android-0.6.19-source.tar.gz
             /tmp/LCS-FFmpeg-7.1.5-source.tar.gz
             android/test-results/
       - name: Java 17
@@ -305,7 +320,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.18-arm64-debug
+          name: LCSRecomp-Android-0.6.19-arm64-debug
           path: |
             android/app/build/outputs/apk/debug/app-debug.apk
             android/app/build/outputs/apk/debug/app-debug.apk.sha256
@@ -315,5 +330,5 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: LCSRecomp-Android-0.6.18-failed-test-results
+          name: LCSRecomp-Android-0.6.19-failed-test-results
           path: android/test-results/

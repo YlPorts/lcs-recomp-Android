@@ -74,7 +74,9 @@ int main(int argc,char**argv){
         std::byte{0},std::byte{0},std::byte{255},std::byte{255},
         std::byte{255},std::byte{255},std::byte{255},std::byte{255}};
     assert(lcs::ge_gpu_backend_upload_decoded_texture(image,2,2,rgba));
-    lcs::GlesBatch batch;batch.draw=image;batch.vertices=vertices(0xffffffff,0);
+    lcs::GlesBatch batch;batch.draw=image;
+    const auto captured_vertices=vertices(0xffffffff,0);
+    batch.vertices.assign(captured_vertices.begin(),captured_vertices.end());
     s.batches.push_back(batch);
     assert(lcs::render_capture_request(argv[1]));lcs::render_capture_frame_boundary();lcs::render_capture_next_draw();
     GLint previous=0;glGetIntegerv(GL_FRAMEBUFFER_BINDING,&previous);
